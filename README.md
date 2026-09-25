@@ -12,47 +12,56 @@ It is not the first tool to let coding agents write to each other through git (s
 
 ## Install
 
+From a clone of this repo, `npm install -g .` installs the `git-bell` command (`npm link` works too):
+
 ```sh
-npm install -g .          # from a clone of this repo (or: npm link); installs the git-bell command
-# or, since it is one file, link it onto your PATH (keep the .mjs name as the target):
-mkdir -p ~/.local/bin && ln -s "$PWD/bell.mjs" ~/.local/bin/git-bell   # make sure ~/.local/bin is on your PATH
-git bell help
+npm install -g .
 ```
 
-Any executable named `git-bell` on your `PATH` becomes the `git bell` subcommand. Ask for help with `git bell help` or `git bell -h`: git answers `git bell --help` itself, by looking for a man page that doesn't exist.
+Or, since it is one file, link it onto your `PATH`. Keep the `.mjs` name as the link's target, and make sure `~/.local/bin` is on your `PATH`:
+
+```sh
+mkdir -p ~/.local/bin && ln -s "$PWD/bell.mjs" ~/.local/bin/git-bell
+```
+
+Then try `git bell help`. Any executable named `git-bell` on your `PATH` becomes the `git bell` subcommand. Ask for help with `git bell help` or `git bell -h`: git answers `git bell --help` itself, by looking for a man page that doesn't exist.
 
 ## 60-second demo
 
-Two worktrees of one repo are two desks sharing one mailbox. Paste this into a shell. If you'd rather, split it across two terminals at the comments, and open the second terminal in the folder the first one is in (`pwd` shows it).
+Two worktrees of one repo are two desks sharing one mailbox. Paste the three blocks below into one terminal, one after another. To feel it properly, use two terminals: open the second one in the same folder as the first (`pwd` in the first shows it).
+
+**Terminal 1: you are claude.** This makes a scratch repo in a temporary folder, with a second worktree next to it, and leaves a note for codex:
 
 ```sh
-cd "$(mktemp -d)"                    # a scratch folder
-git init -q demo && cd demo
-git commit -q --allow-empty -m "first commit"
-git worktree add -q ../demo-codex
-
-# terminal 1: you are claude, in ./demo
+cd "$(mktemp -d)" && git init -q bell-demo && cd bell-demo &&
+  git commit -q --allow-empty -m "first commit" &&
+  git worktree add -q ../bell-demo-codex
 export BELL_AS=claude
 git bell send codex "I'm refactoring src/parser - please stay out of it until I ring" --subject "heads up"
+```
 
-# terminal 2: you are codex, in the other worktree
-cd ../demo-codex
+**Terminal 2: you are codex, in the other worktree.**
+
+```sh
+cd ../bell-demo-codex
 export BELL_AS=codex
 git bell ring
 git bell inbox
 git bell read
 git bell send claude "deal - I'll take the docs instead"
+```
 
-# terminal 1 again
-cd ../demo
+**Terminal 1 again: claude reads the answer.**
+
+```sh
+cd ../bell-demo
 export BELL_AS=claude
 git bell ring
 git bell read
 git for-each-ref refs/bell
-
-unset BELL_AS                        # back to being you
-# clean up: cd .. && rm -rf demo demo-codex
 ```
+
+When you're done, `unset BELL_AS` makes you yourself again. The demo lives in a temporary folder, so there is nothing to clean up.
 
 What you'll see (ids and times will differ):
 
@@ -124,14 +133,16 @@ mkdir -p .cursor/rules && git bell hooks cursor > .cursor/rules/git-bell.mdc
 
 In a plain terminal you are your `user.name` slug, and that is what you want. Don't export `BELL_AS` in your shell rc or run `git config --global bell.name`: both outrank agent detection, so every agent started from that shell or repo would take your name. Run `git bell who` to see who you are.
 
-Two Claude sessions in two worktrees both detect `claude` by default. To tell them apart, give each worktree its own name:
+Two Claude sessions in two worktrees both detect `claude` by default. To tell them apart, give each worktree its own name by running this inside that worktree:
 
 ```sh
 git config extensions.worktreeConfig true
-git config --worktree bell.name claude-parser      # run inside that worktree
+git config --worktree bell.name claude-parser
 ```
 
 ## Ring a live session (optional)
+
+This is not `git bell ring`, which checks your own mail. This rings the recipient.
 
 The letter in git is always the source of truth. If a recipient is running right now, git-bell can also nudge it through a live channel after each successful send or reply. You opt in per name, in your own git config:
 
@@ -139,15 +150,15 @@ The letter in git is always the source of truth. If a recipient is running right
 git config bell.ring.<name> '["program", "arg", "{notice}"]'
 ```
 
-- The value is a JSON array: the program and its arguments. git-bell runs it with `execFileSync` and no shell, so quotes, `$(...)`, `;` and `|` in it are passed on literally.
+- The value is a JSON array: the program and its arguments. git-bell starts the program directly with that argument list and no shell, so quotes, `$(...)`, `;` and `|` in it are passed on literally.
 - Only four literal tokens are replaced: `{from}`, `{to}`, `{id}` and `{notice}`. `{notice}` is a fixed pointer, `git-bell: new message from <from> — run: git bell inbox`. **The body and the subject are never passed to the ring command**, not in its arguments, its input or its environment. Nothing a letter says can reach the command, and no content leaves git this way.
-- A ring that fails, hangs or isn't installed prints one warning. The send still succeeds, because the letter is already delivered. Rings are cut off after 10 seconds (`git config bell.ringTimeout <seconds>` changes that, from 0.1 to 120).
-- A broadcast rings every configured name except the sender's. A name must also be a valid git config key to be rung (letters, digits and `-`, starting with a letter), which covers `claude`, `codex` and `claude-parser`.
+- A ring that fails, hangs or isn't installed prints one warning, which quotes the last line a failed program wrote to stderr. The send still succeeds, because the letter is already delivered. A ring that is still running after 10 seconds is stopped, together with everything it started (on Windows, only the program itself). `git config bell.ringTimeout <seconds>` changes the limit, from 0.1 to 120.
+- A broadcast rings every configured name except the sender's. A name set more than once (`git config --add`) rings every value, in order. A name must also be a valid git config key to be rung (letters, digits and `-`, starting with a letter), which covers `claude`, `codex` and `claude-parser`.
 - `bell.ring.*` is read only from git config (the repo's `.git/config` or your `~/.gitconfig`). Clone, fetch and `git bell sync` never carry git config, so a letter or a remote can't make your machine run anything.
 
 `git bell ring-setup <claude|codex>` prints example config. It only prints commands that were checked:
 
-- **Codex:** `codex queue --thread <session> --message <text>` queues a message for an existing Codex session. Checked against `codex queue --help` in codex-cli 0.154.0 (delivery to a live session was not exercised when this was written):
+- **Codex:** `codex queue --thread <session> --message <text>` queues a message for an existing Codex session. It needs a codex that has `queue`, and a session on Codex's shared local app-server daemon (`codex agents` lists those); a Codex started some other way may not be reachable. Checked against `codex queue --help` in codex-cli 0.154.0 (delivery to a live session was not exercised when this was written):
 
   ```sh
   git config bell.ring.codex '["codex","queue","--thread","YOUR-CODEX-SESSION","--message","{notice}"]'
@@ -182,7 +193,7 @@ Quote message text. `--subject`, `--kind`, `--sign` and `--as` are read anywhere
 ## How it works
 
 ```text
-  worktree ./demo (claude)                       worktree ../demo-codex (codex)
+  worktree ./bell-demo (claude)                  worktree ../bell-demo-codex (codex)
   $ git bell send codex "..."                    $ git bell ring
           |                                        git-bell: 1 unread for codex (from claude)
           | git hash-object + git update-ref                 ^
@@ -207,15 +218,17 @@ Quote message text. `--subject`, `--kind`, `--sign` and `--as` are read anywhere
 - **Read state is a ref too.** `refs/bell/ack/<reader>/<id>` points at the same letter. Unread means there is no ack ref, and each reader has their own.
 - **Worktrees share it for free.** This is the key trick. All linked worktrees share one ref store, and only `HEAD` and a few other refs are per-worktree. A letter sent from any worktree is already in all of them, with no copying and no syncing.
 - **There is no server** because git already is one. Nothing leaves your machine until you run `git bell sync`.
-- **Processes run only through `execFileSync` with argument arrays**, never through a shell: git, and the ring command if you configured one. Names and ids must match `[A-Za-z0-9._-]` (at most 64 characters, starting with a letter or digit, with no `..` and not ending in `.lock` in any case). That rule refuses ref-injection attempts such as `../x` before git sees them. Names are lowercased so that case-insensitive filesystems agree with Linux.
+- **Processes start only with argument arrays**, never through a shell: git, and the ring command if you configured one. Names and ids must match `[A-Za-z0-9._-]` (at most 64 characters, starting with a letter or digit, with no `..` and not ending in `.lock` in any case). That rule refuses ref-injection attempts such as `../x` before git sees them. Names are lowercased so that case-insensitive filesystems agree with Linux.
 
 Letters are ordinary git objects. `git for-each-ref refs/bell` lists them and `git cat-file -p <ref>` shows one. `git log --all` includes them as root commits. To keep them out of that view, use `git log --exclude='refs/bell/*' --all`.
 
 ## Sync across machines
 
+`git bell sync` fetches, then pushes, every letter and read mark under `refs/bell/`, with `origin` or with any other remote you name:
+
 ```sh
-git bell sync            # fetch, then push, every letter and read mark under refs/bell/ with origin
-git bell sync backup     # or any other configured remote
+git bell sync
+git bell sync backup
 ```
 
 `sync` reports how many letters and read marks it received and sent. If a new letter is waiting for you, it also prints your ring line. A plain `git clone` doesn't copy mail, so run `git bell sync` in each clone. In a repo without a remote, `sync` says so and your mail stays local.
@@ -224,33 +237,32 @@ git bell sync backup     # or any other configured remote
 
 **sync pushes your mail to the remote.** On a public repo, anyone can fetch it, even though the web UI doesn't show these refs. Keep secrets out of letters, as you would out of commits.
 
-**Clearing mail.** Letters are refs, so deleting the refs deletes the mail:
+**Clearing mail.** Letters are refs, so deleting the refs deletes the mail. The first line clears this repo, in every worktree; the second clears the remote, if you synced:
 
 ```sh
-git for-each-ref --format='delete %(refname)' refs/bell | git update-ref --stdin    # this repo (every worktree)
-git ls-remote origin 'refs/bell/*' | cut -f2 | xargs -r git push origin --delete   # the remote, if you synced
+git for-each-ref --format='delete %(refname)' refs/bell | git update-ref --stdin
+git ls-remote origin 'refs/bell/*' | cut -f2 | xargs -r git push origin --delete
 ```
 
 Clear the remote as well as your clone, or the next `git bell sync` brings the mail back. Other clones that synced keep their copies until they clear too.
 
 ## Scaling
 
-h5i's design notes chose one log per ref over one ref per message, and gave the reason: "Don't use one ref per message. Git's packed-refs scans linearly and loose refs burn inodes." That is a fair objection, and git-bell answers it with housekeeping rather than a different layout.
+h5i's design notes argued against one ref per message: "Don't use one ref per message. Git's packed-refs scans linearly and loose refs burn inodes." git-bell keeps one ref per letter on purpose and answers with housekeeping:
 
-- **Loose refs.** Each new letter and read mark starts as one small file under `.git/refs/bell/`. `git bell gc` ends with `git pack-refs --all`, which moves them into the single `packed-refs` file (`git gc` packs refs too).
-- **packed-refs.** It is one sorted file, and the work of reading it, and of rewriting it when a ref is deleted, grows with the number of refs it holds. git-bell also lists `refs/bell/` on every command. So the thing to keep small is the mail you keep, not the mail you ever sent: `git bell gc --older-than 30d` deletes letters their owner has already read and that are older than 30 days, together with their read marks. It never deletes unread mail, and it leaves broadcasts alone, since they have no single owner. `--dry-run` prints the counts and changes nothing.
-- **reftable.** Recent git can keep refs in the reftable format instead (`git init --ref-format=reftable`, or `git refs migrate --ref-format=reftable` for an existing repo): compact binary tables, with no file per ref. git-bell works on it unchanged, because it only touches refs through git commands (checked with git 2.53, including `gc`).
-- **Ref advertisement.** Every letter and read mark is a ref a remote can advertise. `git bell sync` lists `refs/bell/*` on the remote each time, so sync gets slower as a shared mailbox grows. Git's protocol v2, the default in current git, lets an ordinary `git fetch` ask only for the refs it wants, so mail doesn't weigh on branch fetches; older clients and servers that speak protocol v0 advertise every ref to every fetch.
-- **gc is local.** It tidies this clone. `sync` only ever adds, so a letter `gc` removed comes back on the next sync if the remote or another clone still has it. To trim a shared mailbox, run `gc` in every clone and delete the same refs on the remote.
+- **gc packs and trims.** `git bell gc` deletes letters their owner has read that are older than 30 days (`--older-than` changes that), with their read marks, then runs `git pack-refs --all` to move the loose ref files into one `packed-refs` file. It never deletes unread mail or broadcasts, and `--dry-run` only counts.
+- **reftable works.** A repo in git's reftable format (`git init --ref-format=reftable`) keeps refs in compact tables with no file per ref, and git-bell runs on it unchanged (checked with git 2.53, `gc` included).
+- **sync lists every letter.** `git bell sync` asks the remote for all of `refs/bell/*` each time, so it slows as a shared mailbox grows. An ordinary `git fetch` over protocol v2, the default in current git, asks only for the refs it wants, so mail doesn't weigh on branch fetches.
+- **gc is local.** A letter `gc` removed comes back on the next sync if the remote or another clone still has it, and it comes back read only if its read mark was synced first. So run `git bell sync` before `gc`, and to trim a shared mailbox, run `gc` in every clone and delete the same refs on the remote.
 
 ## Trust: what git-bell does not promise
 
-- **`from` is unsigned.** It is a label. Anyone who can write to the repo, or push to its remote, can send a letter under any name.
-- **Anyone with push access can write to any inbox or forge an ack.** A forged ack marks someone's mail read, so their `ring` goes quiet.
+- **`from` is unsigned.** It is a label. Anyone who can write to the repo, or push to its remote, can send a letter under any name, and that includes every agent working in it: `--as` or `BELL_AS` picks any name, and the `from` in a ring notice is the same unsigned label.
+- **Anyone with push access can write to any inbox or forge an ack.** A forged ack marks someone's mail read, so their `ring` goes quiet, and a later `gc` in their clone may then delete the letter.
 - **A force-push can delete mail.** `git bell sync` never deletes anything, but anyone with push rights can delete or overwrite refs on the remote, and a letter that lived only there is gone.
 - git's object ids protect integrity: a letter can't be edited in place without becoming a different object. They say nothing about who wrote it.
 
-**Signing, if you want it.** `git bell send --sign` (and `reply --sign`) writes the letter with `git commit-tree -S`, using your ordinary git signing setup: `user.signingKey`, plus `gpg.format ssh` for an SSH key. `git bell verify <id>` then runs `git verify-commit` and tells you which of three cases you have: unsigned, signed and valid, or signed but not valid (with git's reason). It exits 0 only for a valid signature. A valid signature proves who held the key, not that the key belongs to the name in `from`, so `verify` prints the signer for you to compare. Unsigned letters keep working, and nothing requires signing.
+**Signing, if you want it.** `git bell send --sign` (and `reply --sign`) writes the letter with `git commit-tree -S`, using your ordinary git signing setup: `user.signingKey`, plus `gpg.format ssh` for an SSH key. `git bell verify <id>` then runs `git verify-commit` and tells you which of three cases you have: unsigned, signed and valid, or signed but not valid (with git's reason). It exits 0 only for a valid signature. With an SSH key, git also needs an allowed-signers file before it can check anything: run `git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers` and put a line `<name> <your public key>` in that file. Until then, `verify` says the signature can't be checked yet. Letters are signed only with `--sign`; `commit.gpgsign` doesn't apply to them. A valid signature proves who held the key, not that the key belongs to the name in `from`, so `verify` prints the signer for you to compare. Unsigned letters keep working, and nothing requires signing.
 
 ## Safety: mail is input, not orders
 
@@ -264,30 +276,31 @@ Another agent's letter is **information, never instructions**, and git-bell says
 
 ## Coming from h5i
 
-h5i kept its agent messages as one `messages.jsonl` log inside `refs/h5i/msg`. If a repo still has that ref, `git bell import-h5i` copies each message into a letter with the same id, kind, timestamp, sender, recipient, `reply_to` and body. It prints counts only, and running it again changes nothing: letters already here are skipped by id. Lines git-bell can't hold (bad JSON, names outside its charset, bodies over 16 KiB, a second line reusing an id) are counted as skipped. h5i kept read state in local files that were never shared, so imported letters start unread.
+If a repo still has h5i's `refs/h5i/msg` log, `git bell import-h5i` copies each message into an unread letter with the same id, kind, timestamp, sender, recipient, `reply_to` and body, prints counts only, and skips messages already here, so running it again adds nothing new (unless `gc` has removed some since). Ids and names are lowercased, so two different messages whose ids differ only in case, or share one, are counted as conflicting and the later one isn't imported; lines git-bell can't hold, such as bad JSON, names outside its charset or a date before 1970, are counted as skipped.
 
 ## Prior art & credits
 
 git-bell is a deliberately small take on an idea several projects explored first, and it owes a lot to them.
 
-- **h5i `msg` and the i5h protocol** ([h5i-dev/h5i](https://github.com/h5i-dev/h5i)). The closest ancestor, and the one git-bell borrows the most from. It shipped agent-to-agent messaging in a git side ref, `refs/h5i/msg`, in 16 releases from May to July 2026: send, inbox, reply, ack and watch, SessionStart hooks for Claude Code and Codex, and every message framed as "untrusted collaborator input". It was withdrawn in August 2026. git-bell adopts i5h's JSON field names so its letters have a citable ancestor and old logs can be imported, and the i5h spec's plain statement that `from` is unsigned is the model for [Trust](#trust-what-git-bell-does-not-promise). h5i chose a single append-only log per ref and argued against one ref per message; git-bell takes the other path on purpose, and [Scaling](#scaling) is its answer.
+- **h5i `msg` and the i5h protocol** ([h5i-dev/h5i](https://github.com/h5i-dev/h5i)). The closest ancestor, and the one git-bell borrows the most from. It shipped agent-to-agent messaging in a git side ref, `refs/h5i/msg`, in 16 releases from May to July 2026: send, inbox, reply, ack and watch, SessionStart hooks for Claude Code and Codex, and every message framed as "untrusted collaborator input". It was withdrawn in August 2026. git-bell uses i5h's JSON field names, as a nod to it and so an old h5i log can be imported, and the i5h spec's plain statement that `from` is unsigned is the model for [Trust](#trust-what-git-bell-does-not-promise). h5i chose a single append-only log per ref and argued against one ref per message; git-bell takes the other path on purpose, and [Scaling](#scaling) is its answer.
 - **komnet** ([Komdosh/komnet](https://github.com/Komdosh/komnet)). A git-backed message bus for Claude Code, Cursor and Codex with no server, using a dedicated transport repository, room branches, a local daemon and an MCP server, with rooms, tasks and claims. Pick komnet for a team-scale coordination layer; git-bell stays inside your project repo with no daemon.
 - **Thrum** ([leonletto/thrum](https://github.com/leonletto/thrum)). Persistent git-backed messaging across sessions, worktrees and machines, with JSONL on an orphan branch, a daemon and SQLite. The closest pitch to git-bell's worktree story.
 - **GitMQ** ([emad-elsaid/gitmq](https://github.com/emad-elsaid/gitmq), 2019). Empty commits carrying the payload in the commit message, with per-consumer tags as read markers: the same primitive git-bell uses, years earlier, for message queues.
 - **git-native-issue** ([remenoscodes/git-native-issue](https://github.com/remenoscodes/git-native-issue)). Empty-tree root commits under `refs/issues/<uuid>`, synced by refspec over any remote and designed for AI coding agents. It belongs to the wider family that showed structured records can live in refs, with [git-bug](https://github.com/git-bug/git-bug) and [git-appraise](https://github.com/google/git-appraise).
 - **MCP Agent Mail** ([Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail)). An agent inbox with a server, SQLite and a Markdown archive in git. A better fit if you want a server.
-- **Claude Code's cross-session messaging** ([docs](https://code.claude.com/docs/en/cross-session-messaging)) delivers live messages between your own Claude Code sessions, with the same "information, not authority" stance. Codex's `codex queue` messages a running Codex thread. git-bell complements both rather than competing: its letters are durable, wait in the repo for a session that hasn't started yet, work across vendors, and can ring those live channels when you want (see [Ring a live session](#ring-a-live-session-optional)).
+- **post** and **agmsg** ([treygoff24/post](https://github.com/treygoff24/post), [fujibee/agmsg](https://github.com/fujibee/agmsg)). Agent inboxes without git. post's doorbell `watch`, its hooks for Claude Code, Codex and Cursor, and its rule that mail is data, never a prompt, make it a close cousin of git-bell; pick post if you want machine-local files instead of refs, and agmsg if you want a small SQLite mailbox across vendors.
+- **Claude Code's cross-session messaging** ([docs](https://code.claude.com/docs/en/cross-session-messaging)) delivers live messages between your own Claude Code sessions, and, like a git-bell letter, a message there can't approve anything or run commands. Codex's `codex queue` messages a running Codex thread. git-bell complements both rather than competing: its letters are durable, wait in the repo for a session that hasn't started yet, work across vendors, and can ring those live channels when you want (see [Ring a live session](#ring-a-live-session-optional)).
 
 Thank you to all of them.
 
-## Dedication
-
-git-bell is a birthday present. `git bell about` prints the dedication from the top of this page next to an ASCII-art bell and, in a terminal, rings the terminal's own bell too. The text lives in exactly one place, the `DEDICATION` line near the top of `bell.mjs`.
-
 ## Develop
 
+`npm test` runs `node --test`, offline, in throwaway repos under your temp dir:
+
 ```sh
-npm test             # node --test: offline, and uses throwaway repos in your temp dir
+npm test
 ```
+
+git-bell is a birthday present. Run `git bell about` in a terminal to see the dedication beside a little ASCII bell, and to hear the other kind of bell.
 
 MIT licensed. See [LICENSE](LICENSE).

@@ -8,12 +8,12 @@
 // refs/bell/ack/<reader>/<id> marks it read. No server, no files in your
 // working tree, and every worktree of a repo shares the same mailbox.
 //
-// Processes start in exactly two places, both execFileSync with an argument
-// array (no shell is ever involved): git itself, and the optional ring
-// command you configure in your own git config (see ring below).
+// Processes start in exactly two places, each with an argument array and never
+// a shell. git runs through execFileSync, and the optional ring command you
+// configure in your own git config through spawn (see ring below).
 // MIT License.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
@@ -371,41 +371,70 @@ function findMessage(box, rawId, me) {
 //
 //   git config bell.ring.<name> '["program", "arg", "{notice}"]'
 //
-// The value is a JSON array of argv, run with execFileSync and no shell. Only
+// The value is a JSON array of argv, started directly with no shell. Only
 // four literal tokens are replaced: {from}, {to}, {id} and {notice}, a fixed
 // pointer text. The body and subject never leave git, so a letter cannot inject
 // anything into the ring command. A ring that fails, hangs or is missing is a
-// warning: the letter is already delivered.
+// warning: the letter is already delivered. A name set more than once rings
+// every value, in order.
 const RING_TOKENS = /\{(from|to|id|notice)\}/g;
 const NOTICE = (from) => `git-bell: new message from ${from} — run: git bell inbox`;
 const RING_SECONDS = 10;
 
-function ringTargets(msg) {
-  if (msg.to !== BROADCAST) {
-    const spec = gitConfig(`bell.ring.${msg.to}`);
-    return spec ? [[msg.to, spec]] : [];
-  }
-  // A broadcast rings every configured name except the sender.
+// Every value of every bell.ring.<name> key, in git's order: [[name, spec], ...].
+function ringConfig(pattern) {
   let out = '';
   try {
-    out = git(['config', '-z', '--get-regexp', '^bell\\.ring\\.']);
+    out = git(['config', '-z', '--get-regexp', pattern]);
   } catch {
     return []; // none configured
   }
-  const targets = [];
+  const entries = [];
   for (const entry of out.split('\0')) {
     const nl = entry.indexOf('\n');
-    if (nl < 0) continue;
-    const name = entry.slice('bell.ring.'.length, nl);
-    if (isCanonical(name) && name !== msg.from && name !== BROADCAST) targets.push([name, entry.slice(nl + 1)]);
+    if (nl >= 0) entries.push([entry.slice('bell.ring.'.length, nl), entry.slice(nl + 1)]);
   }
-  return targets;
+  return entries;
+}
+
+function ringTargets(msg) {
+  // Names are canonical tokens, so a name never carries a regex metacharacter
+  // other than ".", which is escaped here.
+  if (msg.to !== BROADCAST) return ringConfig(`^bell\\.ring\\.${msg.to.replace(/\./g, '\\.')}$`);
+  // A broadcast rings every configured name except the sender.
+  return ringConfig('^bell\\.ring\\.').filter(([name]) => isCanonical(name) && name !== msg.from && name !== BROADCAST);
 }
 
 function ringSeconds() {
   const raw = gitConfig('bell.ringTimeout');
+  if (!raw) return RING_SECONDS;
   const n = Number(raw);
-  return raw && Number.isFinite(n) && n >= 0.1 && n <= 120 ? n : RING_SECONDS;
+  if (Number.isFinite(n) && n >= 0.1 && n <= 120) return n;
+  warn(`ignoring git config bell.ringTimeout=${sanitize(raw)}: use a number of seconds from 0.1 to 120 (using ${RING_SECONDS})`);
+  return RING_SECONDS;
+}
+
+// The ring runs in a process group of its own, so a timeout stops everything
+// it started (a wrapper such as sh -c or an npm shim, and what that wrapper
+// runs), not only the direct child. Its stderr is kept, never passed through,
+// so a background child it leaves behind cannot hold git-bell open; the last
+// line is shown if the ring fails.
+const GROUPS = process.platform !== 'win32';
+
+// A process group of its own is also out of reach of the terminal's Ctrl-C, so
+// while rings run, git-bell passes an interrupt on to them before it exits.
+const ringing = new Set(); // pids, which are also the process group ids
+const STOP_SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+
+function stopRingsAndExit(signal) {
+  for (const pid of ringing) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+  process.exit(128 + STOP_SIGNALS[signal]);
 }
 
 function ringOne(name, spec, msg, seconds) {
@@ -419,33 +448,77 @@ function ringOne(name, spec, msg, seconds) {
     && argv.every((a) => typeof a === 'string' && a.length <= 4096 && !a.includes('\0'));
   if (!valid) {
     warn(`ignoring git config bell.ring.${name}: it must be a JSON array of strings, such as ["program", "--flag", "{notice}"]`);
-    return;
+    return Promise.resolve();
   }
   const values = { from: msg.from, to: msg.to, id: msg.id, notice: NOTICE(msg.from) };
   argv = argv.map((a) => a.replace(RING_TOKENS, (_, key) => values[key]));
-  try {
-    execFileSync(argv[0], argv.slice(1), {
-      stdio: ['ignore', 'ignore', 'inherit'],
-      timeout: Math.round(seconds * 1000),
-      killSignal: 'SIGKILL',
-      windowsHide: true,
+  return new Promise((resolve) => {
+    let child = null;
+    let stderr = '';
+    let failure = '';
+    let done = false;
+    let timer = null;
+    let grace = null;
+    const finish = (why) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      ringing.delete(child?.pid);
+      child?.stderr?.destroy();
+      child?.unref();
+      if (why) {
+        const said = stderr.split('\n').map((l) => l.trim()).filter(Boolean).at(-1);
+        const detail = said ? `${why}: ${said.slice(0, 300)}` : why;
+        warn(`could not ring ${name} (${sanitize(detail)}); the letter is delivered, so this is only a warning`);
+      }
+      resolve();
+    };
+    try {
+      child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'ignore', 'pipe'], detached: GROUPS, windowsHide: true });
+    } catch (err) {
+      finish(err.code || err.message);
+      return;
+    }
+    if (GROUPS && child.pid) ringing.add(child.pid);
+    timer = setTimeout(() => {
+      try {
+        if (GROUPS) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+      stderr = ''; // what it said before being cut off is not why it failed
+      finish(`timed out after ${seconds}s`);
+    }, Math.round(seconds * 1000));
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (d) => {
+      stderr = (stderr + d).slice(-4096);
     });
-  } catch (err) {
-    let why;
-    if (err.code === 'ENOENT') why = `${argv[0]} was not found`;
-    else if (err.code === 'ETIMEDOUT') why = `timed out after ${seconds}s`;
-    else if (typeof err.status === 'number') why = `exit status ${err.status}`;
-    else if (err.signal) why = `killed by ${err.signal}`;
-    else why = err.code || err.message;
-    warn(`could not ring ${name} (${sanitize(String(why))}); the letter is delivered, so this is only a warning`);
-  }
+    child.stderr?.on('error', () => {});
+    child.on('error', (err) => finish(err.code === 'ENOENT' ? `${argv[0]} was not found` : err.code || err.message));
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer); // it finished in time; anything it left running is its own business
+      ringing.delete(child.pid);
+      failure = code === 0 ? '' : typeof code === 'number' ? `exit status ${code}` : `killed by ${signal}`;
+      // Read what is left of its stderr, but do not wait on a child it left running.
+      grace = setTimeout(() => finish(failure), 200);
+    });
+    child.on('close', () => finish(failure));
+  });
 }
 
-function ring(msg) {
+async function ring(msg) {
   const targets = ringTargets(msg);
   if (targets.length === 0) return;
   const seconds = ringSeconds();
-  for (const [name, spec] of targets) ringOne(name, spec, msg, seconds);
+  const signals = GROUPS ? Object.keys(STOP_SIGNALS) : [];
+  for (const signal of signals) process.on(signal, stopRingsAndExit);
+  try {
+    for (const [name, spec] of targets) await ringOne(name, spec, msg, seconds);
+  } finally {
+    for (const signal of signals) process.off(signal, stopRingsAndExit);
+  }
 }
 
 // ---------------------------------------------------------------- display
@@ -522,7 +595,7 @@ function readText(words) {
 
 const audience = (to) => (to === BROADCAST ? 'everyone (all)' : to);
 
-function cmdSend(opts, [to, ...words]) {
+async function cmdSend(opts, [to, ...words]) {
   if (to === undefined) throw usage('usage: git bell send <to> <text...> [--subject s] [--kind k] [--sign]   (to "all" broadcasts)');
   const recipient = checkName(to, 'recipient', { allowBroadcast: true });
   if (words.length === 0) throw usage('what should the message say? usage: git bell send <to> <text...>  (use "-" to read stdin)');
@@ -531,7 +604,7 @@ function cmdSend(opts, [to, ...words]) {
   const me = whoAmI(opts);
   const msg = writeMessage({ from: me, to: recipient, subject: opts.subject ?? '', body: readText(words), kind, sign: opts.sign });
   console.log(`git-bell: sent ${msg.id} to ${audience(recipient)}`);
-  ring(msg);
+  await ring(msg);
 }
 
 function cmdInbox(opts) {
@@ -583,7 +656,7 @@ function cmdRead(opts, [rawId]) {
   else console.log(dim(`(addressed to ${m.to}, so not marked read for ${me})`));
 }
 
-function cmdReply(opts, [rawId, ...words]) {
+async function cmdReply(opts, [rawId, ...words]) {
   if (rawId === undefined || words.length === 0) throw usage('usage: git bell reply <id> <text...> [--kind k] [--sign]');
   checkId(rawId);
   const kind = checkKind(opts.kind);
@@ -600,7 +673,7 @@ function cmdReply(opts, [rawId, ...words]) {
   const msg = writeMessage({ from: me, to, subject, body: readText(words), replyTo: original.id, kind, sign: opts.sign });
   if (isFor(original, me)) markRead(me, [original]);
   console.log(`git-bell: replied to ${audience(to)} (${msg.id}, re ${original.id})`);
-  ring(msg);
+  await ring(msg);
 }
 
 function cmdAck(opts, [rawId]) {
@@ -801,9 +874,10 @@ function cmdWho(opts) {
 }
 
 // gc: letters are refs, so an old mailbox is many refs. This deletes the
-// letters their owner (the recipient) has read and that are older than N days,
-// with every read mark on them, then packs the refs into one file. Unread mail
-// and broadcasts (which have no single owner) are never deleted.
+// letters their owner (the recipient) has read, by a read mark that points at
+// the letter itself, and that are older than N days, with every read mark on
+// them, then packs the refs into one file. Unread mail and broadcasts (which
+// have no single owner) are never deleted.
 function parseAge(raw) {
   const m = String(raw ?? '30d').match(/^(\d{1,5})d?$/);
   if (!m) throw usage('--older-than takes a number of days, such as 30d (0d means any age)');
@@ -819,21 +893,25 @@ function cmdGc(opts) {
   let unread = 0;
   let newer = 0;
   let broadcasts = 0;
-  const doomed = new Map(); // id -> oid
+  const doomed = new Set(); // ids
   const lines = [];
   for (const m of box.messages) {
+    // Deleting is final, so only a read mark that points at this very letter
+    // counts here, not just one with the same id (as a forged ack could have).
+    const readByOwner = box.refs.get(`refs/bell/ack/${m.to}/${m.id}`) === m.oid;
     if (m.to === BROADCAST) broadcasts += 1;
-    else if (isUnread(m, m.to, box.acks)) unread += 1;
+    else if (!readByOwner) unread += 1;
     else if (Date.parse(m.ts) > cutoff) newer += 1;
     else {
-      doomed.set(m.id, m.oid);
+      doomed.add(m.id);
       lines.push(`delete refs/bell/inbox/${m.to}/${m.id} ${m.oid}\n`);
     }
   }
+  // Every read mark on a deleted letter goes with it, whatever it points at.
   let marks = 0;
   for (const [ref, oid] of box.refs) {
     const found = mailRef(ref);
-    if (found?.kind === 'ack' && doomed.get(found.id) === oid) {
+    if (found?.kind === 'ack' && doomed.has(found.id)) {
       lines.push(`delete ${ref} ${oid}\n`);
       marks += 1;
     }
@@ -847,6 +925,9 @@ function cmdGc(opts) {
   if (lines.length) git(['update-ref', '--stdin'], lines.join('')); // one atomic transaction
   git(['pack-refs', '--all']);
   console.log(`git-bell: gc deleted ${counts}; ${kept}; packed refs`);
+  if (doomed.size && git(['remote']).trim()) {
+    warn('gc only tidies this clone. If a remote still has these letters, git bell sync brings them back, and they come back read only if you ran git bell sync before gc.');
+  }
 }
 
 // verify: a letter's "from" is a label anyone with write access can set. A
@@ -874,7 +955,13 @@ function cmdVerify(opts, [rawId]) {
   } catch (err) {
     if (!(err instanceof BellError)) throw err;
     const detail = (err.lines ?? []).filter((l) => !/^Good /.test(l)).at(-1) ?? err.message;
-    console.log(`git-bell: ${m.id} is signed, but the signature is NOT valid: ${sanitize(detail)}`);
+    // With an SSH key, git checks signatures only against an allowed-signers
+    // file; without one, every signature fails. That is setup, not forgery.
+    if (/allowedSignersFile needs to be configured/.test(detail)) {
+      console.log(`git-bell: ${m.id} is signed, but git cannot check the signature until its verifier is set up: ${sanitize(detail)}. Point gpg.ssh.allowedSignersFile at a file of "<name> <public key>" lines (see the README's Signing section).`);
+    } else {
+      console.log(`git-bell: ${m.id} is signed, but the signature is NOT valid: ${sanitize(detail)}`);
+    }
     process.exitCode = 1;
     return;
   }
@@ -885,6 +972,8 @@ function cmdVerify(opts, [rawId]) {
 // import-h5i: h5i's msg feature kept an i5h log, one JSON object per line, in
 // messages.jsonl inside refs/h5i/msg. Each line becomes a letter with the same
 // id, so a second run finds them all already here and changes nothing.
+const H5I_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+
 function fromH5i(line) {
   let m;
   try {
@@ -897,7 +986,9 @@ function fromH5i(line) {
   if (!isToken(m.id) || !isToken(m.from) || !isToken(m.to)) return null;
   const from = m.from.toLowerCase();
   if (from === BROADCAST) return null;
-  if (typeof m.ts !== 'string' || Number.isNaN(Date.parse(m.ts))) return null;
+  // An RFC 3339 time, as i5h writes, no earlier than 1970: a git commit cannot
+  // hold an earlier date, and a loose one such as "1" would parse as a guess.
+  if (typeof m.ts !== 'string' || !H5I_TS.test(m.ts) || !(Date.parse(m.ts) >= 0)) return null;
   if (typeof m.body !== 'string' || Buffer.byteLength(m.body, 'utf8') > BODY_MAX) return null;
   const kind = m.kind ?? 'msg';
   if (!isKind(kind)) return null;
@@ -916,29 +1007,43 @@ function cmdImportH5i() {
     return;
   }
   const box = loadMailbox();
-  const here = new Set(box.delivered.map((d) => d.id));
-  const seen = new Set();
+  // What each id holds already, as the letter's JSON; null for a ref whose
+  // letter is malformed. Ids are lowercased, so "MSG-1" and "msg-1" are one id.
+  const held = new Map(box.delivered.map((d) => [d.id, null]));
+  for (const { oid, ...m } of box.messages) held.set(m.id, JSON.stringify(m));
   let imported = 0;
-  let already = 0;
-  let skipped = 0;
+  let already = 0; // the same message is here already (or earlier in this log)
+  let skipped = 0; // not an i5h message git-bell can hold, or one git refused to store
+  let conflicting = 0; // an id already taken by a different message: not imported
   const creates = [];
   for (const line of log.split('\n')) {
     if (!line.trim()) continue;
     const m = fromH5i(line);
-    if (!m || seen.has(m.id)) {
-      skipped += 1; // not an i5h message git-bell can hold, or a second line with an id already taken
+    if (!m) {
+      skipped += 1;
       continue;
     }
-    seen.add(m.id);
-    if (here.has(m.id)) {
-      already += 1;
+    const text = JSON.stringify(m);
+    if (held.has(m.id)) {
+      if (held.get(m.id) === text) already += 1;
+      else conflicting += 1;
       continue;
     }
-    creates.push(`create refs/bell/inbox/${m.to}/${m.id} ${commitLetter(m)}\n`);
+    let oid;
+    try {
+      oid = commitLetter(m);
+    } catch (err) {
+      if (!(err instanceof BellError)) throw err;
+      skipped += 1;
+      continue;
+    }
+    held.set(m.id, text);
+    creates.push(`create refs/bell/inbox/${m.to}/${m.id} ${oid}\n`);
     imported += 1;
   }
   if (creates.length) git(['update-ref', '--stdin'], creates.join(''));
-  console.log(`git-bell: imported ${plural(imported, 'letter')} from refs/h5i/msg (${already} already here, ${skipped} skipped)`);
+  const clash = conflicting ? `, ${conflicting} conflicting: not imported` : '';
+  console.log(`git-bell: imported ${plural(imported, 'letter')} from refs/h5i/msg (${already} already here, ${skipped} skipped${clash})`);
 }
 
 // Each snippet goes to stdout and nothing else, so `> file` captures it whole;
@@ -998,7 +1103,10 @@ const RING_SETUP = {
     '#   "Queue a message for an existing session"',
     '#   usage: codex queue [OPTIONS] --thread <THREAD> --message <TEXT>',
     '#   --thread <THREAD>  "Session UUID or exact session name"',
-    '# Replace YOUR-CODEX-SESSION with that session\'s UUID or exact name (`codex agents` browses them):',
+    '# It reaches sessions on Codex\'s shared local app-server daemon ("codex agents" browses them);',
+    '# a Codex started some other way may not be reachable. Delivery to a live session was not',
+    '# exercised when this was written, so try it once with a throwaway session.',
+    '# Replace YOUR-CODEX-SESSION with that session\'s UUID or exact name:',
     `git config bell.ring.codex '${JSON.stringify(['codex', 'queue', '--thread', 'YOUR-CODEX-SESSION', '--message', '{notice}'])}'`,
     '#',
     '# The session is sent only this fixed pointer, never the letter itself:',
@@ -1152,7 +1260,7 @@ function main(argv) {
 }
 
 try {
-  main(process.argv.slice(2));
+  await main(process.argv.slice(2));
 } catch (err) {
   if (!(err instanceof BellError)) throw err;
   warn(err.message);

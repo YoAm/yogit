@@ -515,13 +515,12 @@ test('text displays cleanly: CRLF line ends, emoji at the cut', () => withSandbo
   assert.ok(listing.includes(`${'a'.repeat(56)}😀...`), listing);
 }));
 
-test('no shell anywhere: git and ring commands run via execFileSync with argument arrays, bodies stay inert', () => withSandbox((sb) => {
-  assert.match(SOURCE, /^import \{ execFileSync \} from 'node:child_process';$/m);
-  assert.doesNotMatch(SOURCE, /shell\s*:|execSync|\bexec\s*\(|\bspawn(Sync)?\s*\(|child_process\.exec\b/);
-  const calls = SOURCE.match(/execFileSync\(/g) || [];
-  assert.equal(calls.length, 2, 'exactly two spawn sites: git, and the opt-in ring command');
-  assert.match(SOURCE, /execFileSync\('git', args, \{/);
-  assert.match(SOURCE, /execFileSync\(argv\[0\], argv\.slice\(1\), \{/);
+test('no shell anywhere: git and ring commands run with argument arrays, bodies stay inert', () => withSandbox((sb) => {
+  assert.match(SOURCE, /^import \{ execFileSync, spawn \} from 'node:child_process';$/m);
+  assert.doesNotMatch(SOURCE, /shell\s*:|execSync|\bexec\s*\(|\bspawnSync\s*\(|child_process\.exec\b/);
+  // Exactly two places start a process: git, and the opt-in ring command.
+  assert.deepEqual(SOURCE.match(/\bexecFileSync\(.*/g), ["execFileSync('git', args, {"]);
+  assert.deepEqual(SOURCE.match(/\bspawn\(.*/g), ["spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'ignore', 'pipe'], detached: GROUPS, windowsHide: true });"]);
 
   const repo = sb.repo('repo');
   const canary = join(sb.dir, 'pwned');
@@ -620,6 +619,82 @@ test('ring bridge: a missing, failing, slow or malformed ring is a warning and t
     }
     assert.ok(sb.refs(repo).includes(`refs/bell/inbox/codex/${id}`), `delivered despite: ${value}`);
   }
+  // A failing ring's own last word is passed on, made safe to print.
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify([process.execPath, '-e', 'console.error("no such session: x\\x1b[31m"); process.exit(4)']));
+  const said = sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']);
+  sentId(said);
+  assert.match(said.err, /could not ring codex \(exit status 4: no such session: x\\u001b\[31m\)/);
+}));
+
+// A ring command is often a wrapper (sh -c, an npm or nvm shim) around the real
+// program, so a timeout must stop everything the ring started, not just the
+// wrapper; and a background child it leaves behind must not hold git-bell up.
+test('ring bridge: a timeout stops the whole ring, and a lingering child does not hold git-bell open', { skip: process.platform === 'win32' && 'process groups are POSIX-only' }, () => withSandbox(async (sb) => {
+  const repo = sb.repo('repo');
+  sb.git(repo, 'config', 'bell.ringTimeout', '0.3');
+  const late = join(sb.dir, 'late');
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(['sh', '-c', `(sleep 1; touch '${late}') & wait`]));
+  const wrapped = sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']);
+  sentId(wrapped);
+  assert.match(wrapped.err, /could not ring codex \(timed out after 0\.3s\)/);
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(existsSync(late), false, 'the wrapped program was stopped with its wrapper, not left to ring after the warning');
+
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(['sh', '-c', 'sleep 5 >&2 & exit 0']));
+  const started = Date.now();
+  const lingering = sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']);
+  sentId(lingering);
+  assert.ok(Date.now() - started < 2500, `git-bell returned after ${Date.now() - started}ms; a child holding the ring's stderr kept it open`);
+  assert.equal(lingering.err, '', 'the ring itself succeeded');
+}));
+
+// The ring's own process group is out of reach of the terminal's Ctrl-C, so
+// git-bell must pass an interrupt on rather than orphan a hanging ring.
+test('ring bridge: Ctrl-C during a ring stops the ring too', { skip: process.platform === 'win32' && 'process groups are POSIX-only' }, () => withSandbox(async (sb) => {
+  const repo = sb.repo('repo');
+  const late = join(sb.dir, 'late');
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(['sh', '-c', `sleep 1; touch '${late}'`]));
+  const child = spawn(process.execPath, [BELL, 'send', 'codex', 'hi', '--as', 'claude'], { cwd: repo, env: sb.baseEnv });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const start = Date.now();
+  while (!/sent \S+ to codex/.test(out) && Date.now() - start < 5000) await new Promise((r) => setTimeout(r, 20));
+  assert.match(out, /sent \S+ to codex/, 'the letter went out before the ring started');
+  await new Promise((r) => setTimeout(r, 150));
+  child.kill('SIGINT');
+  const { code } = await exited;
+  assert.equal(code, 130, 'git-bell stops as an interrupted program does');
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.equal(existsSync(late), false, 'and the ring stopped with it');
+}));
+
+test('ring bridge: every value of a multi-valued bell.ring.<name> rings, on a direct send as on a broadcast', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const argv = recorder(sb);
+  sb.git(repo, 'config', 'bell.ring.cursor', JSON.stringify(argv('first', ['{to}'])));
+  sb.git(repo, 'config', '--add', 'bell.ring.cursor', JSON.stringify(argv('second', ['{to}'])));
+  sentId(sb.bell(repo, ['send', 'cursor', 'direct', '--as', 'claude']));
+  assert.deepEqual(rang(sb, 'first')?.args, ['cursor'], 'the first value rang');
+  assert.deepEqual(rang(sb, 'second')?.args, ['cursor'], 'and so did the second');
+  rmSync(join(sb.dir, 'rang-first.json'));
+  rmSync(join(sb.dir, 'rang-second.json'));
+  sentId(sb.bell(repo, ['send', 'all', 'broadcast', '--as', 'claude']));
+  assert.deepEqual([rang(sb, 'first')?.args, rang(sb, 'second')?.args], [['all'], ['all']]);
+}));
+
+test('ring bridge: an unusable bell.ringTimeout is reported, not silently replaced', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(recorder(sb)('codex', ['{id}'])));
+  for (const value of ['abc', '0', '0.05', '121']) {
+    sb.git(repo, 'config', 'bell.ringTimeout', value);
+    const r = sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']);
+    sentId(r);
+    assert.match(r.err, new RegExp(`ignoring git config bell\\.ringTimeout=${value.replace('.', '\\.')}: use a number of seconds from 0\\.1 to 120`), value);
+    assert.equal(r.err.split('\n').filter(Boolean).length, 1, `one warning, once: ${r.err}`);
+  }
+  sb.git(repo, 'config', 'bell.ringTimeout', '2.5');
+  assert.equal(sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']).err, '', 'a valid value is quiet');
 }));
 
 test('ring-setup prints verified examples only, and writes nothing', () => withSandbox((sb) => {
@@ -676,14 +751,14 @@ test('import-h5i turns a refs/h5i/msg log into letters, prints counts only, and 
 
   const first = sb.bell(repo, ['import-h5i']);
   assert.equal(first.code, 0, first.err);
-  assert.equal(first.out, 'git-bell: imported 3 letters from refs/h5i/msg (0 already here, 3 skipped)\n');
+  assert.equal(first.out, 'git-bell: imported 3 letters from refs/h5i/msg (0 already here, 2 skipped, 1 conflicting: not imported)\n', 'the second line reusing an id is a conflict, not a routine skip');
   assert.ok(!(first.out + first.err).includes('SECRET-ASK'), 'counts only, no bodies');
   const after = sb.refs(repo);
   assert.equal(after.length, 3);
 
   const second = sb.bell(repo, ['import-h5i']);
   assert.equal(second.code, 0, second.err);
-  assert.equal(second.out, 'git-bell: imported 0 letters from refs/h5i/msg (3 already here, 3 skipped)\n');
+  assert.equal(second.out, 'git-bell: imported 0 letters from refs/h5i/msg (3 already here, 2 skipped, 1 conflicting: not imported)\n');
   assert.deepEqual(sb.refs(repo), after, 'a second run changes nothing');
 
   const [forCodex] = inboxJson(sb, repo, 'codex').messages;
@@ -699,6 +774,40 @@ test('import-h5i turns a refs/h5i/msg log into letters, prints counts only, and 
   const [forBob] = inboxJson(sb, repo, 'bob').messages;
   assert.equal(forBob.to, 'all');
   assert.equal(forBob.kind, 'msg', 'an h5i v0 line has no kind');
+}));
+
+test('import-h5i skips a line git cannot store (a date before 1970, a loose date) and still imports the rest', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const line = (id, ts) => JSON.stringify({ version: 1, id, ts, from: 'claude', to: 'codex', kind: 'ASK', body: `body of ${id}` });
+  h5iLog(sb, repo, [
+    line('good-1', '2026-05-28T22:18:04.123Z'),
+    line('pre-epoch', '1969-12-31T23:59:59Z'),
+    line('year-one', '0001-01-01T00:00:00Z'),
+    line('loose-date', '1'),
+    line('good-2', '2026-05-28T22:18:05.123Z'),
+  ]);
+  const r = sb.bell(repo, ['import-h5i']);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out, 'git-bell: imported 2 letters from refs/h5i/msg (0 already here, 3 skipped)\n');
+  assert.deepEqual(sb.refs(repo), ['refs/bell/inbox/codex/good-1', 'refs/bell/inbox/codex/good-2']);
+}));
+
+test('import-h5i counts an id that two different messages share as conflicting, never as a routine skip', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const msg = (id, body, kind = 'FYI') => ({ version: 1, id, ts: '2026-05-28T22:18:04.123Z', from: 'claude', to: 'codex', kind, body });
+  h5iLog(sb, repo, [
+    JSON.stringify(msg('MSG-1', 'first message')),
+    JSON.stringify(msg('msg-1', 'second, different message', 'ASK')), // ids are lowercased, so this one collides
+    JSON.stringify(msg('MSG-1', 'first message')), // the same message twice: a duplicate, not a conflict
+  ]);
+  const first = sb.bell(repo, ['import-h5i']);
+  assert.equal(first.code, 0, first.err);
+  assert.equal(first.out, 'git-bell: imported 1 letter from refs/h5i/msg (1 already here, 0 skipped, 1 conflicting: not imported)\n');
+
+  // A later log whose line differs from the letter already here conflicts too.
+  h5iLog(sb, repo, [JSON.stringify(msg('msg-1', 'rewritten since the last import'))]);
+  assert.equal(sb.bell(repo, ['import-h5i']).out, 'git-bell: imported 0 letters from refs/h5i/msg (0 already here, 0 skipped, 1 conflicting: not imported)\n');
+  assert.equal(inboxJson(sb, repo, 'codex').messages[0].body, 'first message', 'the letter already here is untouched');
 }));
 
 test('gc deletes only mail its owner acked that is older than N days, never unread mail, then packs refs', () => withSandbox((sb) => {
@@ -751,6 +860,39 @@ test('gc deletes only mail its owner acked that is older than N days, never unre
   assert.equal(sb.bell(repo, ['gc', '--older-than', '-1d']).code, 2);
 }));
 
+test('gc trusts an owner ack only if it points at the letter, and deletes every read mark of a letter it deletes', () => withSandbox((sb) => {
+  const repo = sb.repo('repo', { commit: true });
+  const head = sb.git(repo, 'rev-parse', 'HEAD');
+  const old = '2020-01-01T00:00:00.000Z';
+  // An ack by id alone, pointing somewhere else: forged, or synced in from a remote.
+  const neverSeen = { version: 1, id: '20200101-000000-bbbbb1', ts: old, from: 'claude', to: 'codex', kind: 'msg', subject: '', body: 'codex never saw this' };
+  plant(sb, repo, neverSeen);
+  sb.git(repo, 'update-ref', `refs/bell/ack/codex/${neverSeen.id}`, head);
+  // A letter codex really read, plus a stale read mark by someone else that points elsewhere.
+  const read = { version: 1, id: '20200101-000000-bbbbb2', ts: old, from: 'claude', to: 'codex', kind: 'msg', subject: '', body: 'read by codex' };
+  plant(sb, repo, read, { acks: ['codex'] });
+  sb.git(repo, 'update-ref', `refs/bell/ack/mallory/${read.id}`, head);
+
+  const r = sb.bell(repo, ['gc', '--older-than', '0d']);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out, 'git-bell: gc deleted 1 message and 2 read marks older than 0d; kept 1 unread, 0 read but newer, 0 broadcasts; packed refs\n');
+  assert.deepEqual(sb.refs(repo), [`refs/bell/ack/codex/${neverSeen.id}`, `refs/bell/inbox/codex/${neverSeen.id}`], 'the unseen letter stays, and nothing of the deleted one is left behind');
+}));
+
+test('gc in a clone with a remote says that sync can bring deleted letters back', () => withSandbox((sb) => {
+  const { a } = hubAndClones(sb);
+  const id = sentId(sb.bell(a, ['send', 'codex', 'please review X', '--as', 'claude']));
+  assert.equal(sb.bell(a, ['sync', '--as', 'claude']).code, 0);
+  sb.bell(a, ['read', id, '--as', 'codex']);
+  const r = sb.bell(a, ['gc', '--older-than', '0d']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /^git-bell: gc deleted 1 message and 1 read mark/);
+  assert.match(r.err, /gc only tidies this clone/);
+  assert.match(r.err, /git bell sync.*before gc/);
+  const lonely = sb.repo('lonely');
+  assert.equal(sb.bell(lonely, ['gc']).err, '', 'no remote, no note');
+}));
+
 test('verify reports an unsigned letter, and send --sign fails cleanly with no key', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   const id = sentId(sb.bell(repo, ['send', 'codex', 'plain', '--as', 'claude']));
@@ -798,6 +940,13 @@ test('send --sign makes a signed letter, and verify tells valid from invalid', {
   const bad = sb.bell(repo, ['verify', id]);
   assert.equal(bad.code, 1);
   assert.match(bad.out, new RegExp(`^git-bell: ${id} is signed, but the signature is NOT valid`));
+
+  // No allowed-signers file at all is a setup gap, not a bad signature.
+  sb.git(repo, 'config', '--unset', 'gpg.ssh.allowedSignersFile');
+  const unchecked = sb.bell(repo, ['verify', id]);
+  assert.equal(unchecked.code, 1);
+  assert.match(unchecked.out, new RegExp(`^git-bell: ${id} is signed, but git cannot check the signature until its verifier is set up: .*allowedSignersFile`));
+  assert.doesNotMatch(unchecked.out, /NOT valid/);
 }));
 
 test('watch prints one framed line per new message', async () => {
@@ -904,4 +1053,47 @@ test('the dedication: exactly one line in bell.mjs, printed by about, at the top
     const text = readFileSync(join(ROOT, file), 'utf8');
     assert.ok(!/\{\{[A-Z]+\}\}/.test(text), `no gifter placeholder (like the old FRIEND/FROM ones) left in ${file}`);
   }
+}));
+
+// Stock zsh has INTERACTIVE_COMMENTS off, so a pasted "# ..." is an argument,
+// not a comment: `cd "$(mktemp -d)"   # a scratch folder` fails, and every line
+// after it runs in whatever folder the reader started from.
+const README_SH = [...readFileSync(join(ROOT, 'README.md'), 'utf8').matchAll(/^```sh\n([\s\S]*?)^```$/gm)].map((m) => m[1]);
+
+test('README shell blocks paste into any shell: no comments inside them', () => {
+  assert.ok(README_SH.length >= 6, `found the README's sh blocks (${README_SH.length})`);
+  assert.ok(README_SH.some((b) => b.includes('git bell send codex')), 'including the demo');
+  for (const block of README_SH) {
+    for (const line of block.split('\n')) {
+      assert.doesNotMatch(line, /(^|\s)#/, `a comment in a README sh block breaks when pasted into stock zsh: ${line}`);
+    }
+  }
+});
+
+const hasBash = !spawnSync('bash', ['-c', 'true'], { stdio: 'ignore' }).error;
+
+test('the README 60-second demo runs as written, in one shell, and never leaves its scratch folder', { skip: !hasBash && 'bash not found' }, () => withSandbox((sb) => {
+  const demo = README_SH.filter((b) => /bell-demo/.test(b));
+  assert.equal(demo.length, 3, 'three blocks: terminal 1, terminal 2, terminal 1 again');
+  assert.match(demo[0], /^cd "\$\(mktemp -d\)" && git init -q bell-demo && cd bell-demo/, 'the setup stops at the first failure');
+  const bin = join(sb.dir, 'bin');
+  mkdirSync(bin);
+  symlinkSync(BELL, join(bin, 'git-bell'));
+  const start = join(sb.dir, 'start');
+  const scratch = join(sb.dir, 'tmp');
+  mkdirSync(start);
+  mkdirSync(scratch);
+  const r = spawnSync('bash', ['-e', '-c', demo.join('\n')], {
+    cwd: start,
+    env: { ...sb.baseEnv, ...IDENT, PATH: `${bin}:${process.env.PATH}`, TMPDIR: scratch },
+    encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, `the demo failed: ${r.stderr}`);
+  assert.deepEqual(readdirSync(start), [], 'nothing landed in the folder the reader started from');
+  assert.match(r.stdout, /^git-bell: sent \S+ to codex$/m);
+  assert.match(r.stdout, /^git-bell: 1 unread for codex \(from claude\) - run: git bell inbox$/m);
+  assert.match(r.stdout, /I'm refactoring src\/parser/);
+  assert.match(r.stdout, /^git-bell: 1 unread for claude \(from codex\) - run: git bell inbox$/m);
+  assert.match(r.stdout, /deal - I'll take the docs instead/);
+  assert.equal(r.stdout.match(/ commit\trefs\/bell\//g)?.length, 4, 'for-each-ref lists two letters and two read marks');
 }));
