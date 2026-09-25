@@ -1199,8 +1199,24 @@ function cmdRead(opts, [rawId]) {
   else console.log(dim(`(addressed to ${m.to}, so not marked read for ${me})`));
 }
 
+// For a usage error with no id: your newest letter's short id, or ''.
+function newestId(opts) {
+  try {
+    if (!inRepo()) return '';
+    const box = loadMailbox();
+    const newest = myMail(box, whoAmI(opts), { all: true })[0];
+    return newest ? hexTail(newest.id) || newest.id : '';
+  } catch {
+    return '';
+  }
+}
+
 async function cmdReply(opts, [rawId, ...words]) {
-  if (rawId === undefined || words.length === 0) throw usage('usage: yogit reply <id> <text...> [--kind k] [--sign]');
+  if (rawId === undefined) {
+    const newest = newestId(opts);
+    throw usage(`usage: yogit reply <id> <text...> [--kind k] [--sign]${newest ? `. Your newest letter: yogit reply ${newest} "..."` : ''}`);
+  }
+  if (words.length === 0) throw usage('usage: yogit reply <id> <text...> [--kind k] [--sign]');
   checkId(rawId);
   const kind = checkKind(opts.kind);
   requireRepo();
@@ -1234,7 +1250,10 @@ function refuseOthers(m, me, what) {
 // ack means handled. It takes the letter out of unread, and it is always
 // shared with the sender, since it is said on purpose.
 function cmdAck(opts, [rawId]) {
-  if (rawId === undefined && !opts.all) throw usage('usage: yogit ack <id> | yogit ack --all');
+  if (rawId === undefined && !opts.all) {
+    const newest = newestId(opts);
+    throw usage(`usage: yogit ack <id> | yogit ack --all${newest ? `. Your newest letter: yogit ack ${newest}` : ''}`);
+  }
   if (rawId !== undefined) checkId(rawId);
   requireRepo();
   const me = whoAmI(opts);
@@ -2120,9 +2139,26 @@ function cmdAbout() {
   if (process.stdout.isTTY) process.stdout.write('\x07'); // and the other ASCII bell, BEL
 }
 
+// yogit with no command: who you are here and what is waiting, read-only (it
+// records no delivered event), always exit 0. Outside a repo, where to start.
+function cmdHome(opts) {
+  if (!inRepo()) {
+    console.log(`yogit ${VERSION} - a mailbox for coding agents, kept inside git\ncd into a repo, then: yogit init\nmore: yogit help`);
+    return;
+  }
+  const id = identifyOrNull(opts);
+  console.log(`yogit ${VERSION} - ${youAre(id)}`);
+  const box = loadMailbox();
+  if (id) console.log(ringLine(box, id.name) || `yogit: no unread mail for ${id.name}`);
+  const hint = syncHint(box);
+  if (hint) console.log(dim(`  ${hint}`));
+  console.log(`more: yogit help${id ? '' : ' (yogit doctor shows how names are chosen)'}`);
+}
+
 const HELP = `yogit ${VERSION} - a doorbell and mailbox for coding agents, kept inside your git repo
 
 usage: yogit <command> [arguments] [--as <name>]
+       yogit                         who you are here, and your unread mail
 
   send <to> <text...>                leave a message ("all" broadcasts; text "-" reads stdin)
        [--subject s] [--kind k] [--sign]
@@ -2150,6 +2186,7 @@ usage: yogit <command> [arguments] [--as <name>]
   import-h5i                         copy an h5i refs/h5i/msg log into letters
   hooks <claude|codex|cursor>        print a setup snippet for that agent
   ring-setup <claude|codex>          print how to ring a live session after each send
+  version                            print the version (also --version)
   about                              version and dedication
 
 try:  yogit send codex "tests are green"      then, as codex:  yogit ring; yogit read
@@ -2203,7 +2240,8 @@ function parseArgs(argv) {
       } else if (BOOL_FLAGS.has(name) && eq < 0) {
         opts[name] = true;
       } else {
-        throw usage(`unknown option ${a} (to send it as text, quote the text or put it after --)`);
+        const guess = closest(name, [...VALUE_FLAGS, ...BOOL_FLAGS]);
+        throw usage(`unknown option ${a}${guess ? ` - did you mean --${guess}?` : ''} (to send it as text, quote the text or put it after --)`);
       }
     } else opts._.push(a);
   }
@@ -2232,15 +2270,20 @@ const COMMANDS = {
   hooks: cmdHooks,
   'ring-setup': cmdRingSetup,
   about: cmdAbout,
+  version: () => console.log(`yogit ${VERSION}`),
 };
 
 function main(argv) {
   const opts = parseArgs(argv);
   const [command, ...rest] = opts._;
   if (opts.version) return console.log(`yogit ${VERSION}`);
-  if (opts.help || command === undefined || command === 'help') return console.log(HELP);
+  if (opts.help || command === 'help') return console.log(HELP);
+  if (command === undefined) return cmdHome(opts);
   const handler = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : undefined;
-  if (!handler) throw usage(`unknown command "${command}" (try: yogit help)`);
+  if (!handler) {
+    const guess = closest(command, [...Object.keys(COMMANDS), 'help']);
+    throw usage(`unknown command "${command}"${guess ? ` - did you mean: yogit ${guess}?` : ''} (yogit help lists them all)`);
+  }
   return handler(opts, rest);
 }
 

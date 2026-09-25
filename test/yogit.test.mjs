@@ -1293,6 +1293,47 @@ test('package, --version and --help name yogit', () => withSandbox((sb) => {
   assert.equal(sb.bell(sb.dir, ['help']).out, help.out);
 }));
 
+test('bare yogit says who you are and what is waiting, and mistakes get the command you meant', () => withSandbox((sb) => {
+  const outside = join(sb.dir, 'outside');
+  mkdirSync(outside);
+  const intro = sb.bell(outside, []);
+  assert.equal(intro.code, 0);
+  assert.match(intro.out, /cd into a repo, then: yogit init/);
+  assert.match(intro.out, /yogit help/);
+
+  const repo = sb.repo('repo');
+  const nameless = sb.bell(repo, []);
+  assert.equal(nameless.code, 0, 'bare yogit always exits 0');
+  assert.match(nameless.out, /yogit name <name>/);
+  const id = sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const events = () => sb.refs(repo, 'refs/bell/event');
+  const before = events();
+  const status = sb.bell(repo, [], { env: { CLAUDECODE: '1' } });
+  assert.equal(status.code, 0, status.err);
+  assert.match(status.out, /^yogit \S+ - you are claude \(detected: CLAUDECODE\)$/m);
+  assert.match(status.out, /1 unread for claude/);
+  assert.match(status.out, /more: yogit help/);
+  assert.deepEqual(events(), before, 'read-only: it records no delivered event');
+  assert.match(sb.bell(repo, ['--as', 'codex']).out, /you are codex \(--as\)\n.*no unread mail for codex/);
+
+  assert.equal(sb.bell(repo, ['version']).out, sb.bell(repo, ['--version']).out);
+  const option = sb.bell(repo, ['send', 'claude', 'hi', '--sbject', 'x', '--as', 'codex']);
+  assert.equal(option.code, 2);
+  assert.match(option.err, /did you mean --subject\?/);
+  const command = sb.bell(repo, ['inbx']);
+  assert.equal(command.code, 2);
+  assert.match(command.err, /did you mean: yogit inbox\?/);
+
+  // A usage error with no id names your newest letter.
+  const reply = sb.bell(repo, ['reply'], { env: { CLAUDECODE: '1' } });
+  assert.equal(reply.code, 2);
+  assert.ok(reply.err.includes(`yogit reply ${id.slice(-6)} "..."`), reply.err);
+  const ack = sb.bell(repo, ['ack'], { env: { CLAUDECODE: '1' } });
+  assert.equal(ack.code, 2);
+  assert.ok(ack.err.includes(`yogit ack ${id.slice(-6)}`), ack.err);
+  assert.equal(sb.bell(outside, ['reply']).code, 2, 'still a usage error outside a repo');
+}));
+
 test('"git yogit" works as a git subcommand when git-yogit is on PATH', () => withSandbox((sb) => {
   const bin = join(sb.dir, 'bin');
   mkdirSync(bin);
