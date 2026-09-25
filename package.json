@@ -1,6 +1,6 @@
 {
   "name": "git-bell",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "A mailbox for coding-agent sessions (Claude Code, Codex, Cursor, humans), kept inside your git repo as refs. One file, zero dependencies. Run it as `git bell`.",
   "type": "module",
   "bin": {
