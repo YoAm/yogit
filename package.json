@@ -1,13 +1,14 @@
 {
-  "name": "git-bell",
+  "name": "yogit",
   "version": "2.1.0",
-  "description": "A mailbox for coding-agent sessions (Claude Code, Codex, Cursor, humans), kept inside your git repo as refs. One file, zero dependencies. Run it as `git bell`.",
+  "description": "A mailbox for coding-agent sessions (Claude Code, Codex, Cursor, humans), kept inside your git repo as refs. One file, zero dependencies. Run it as `yogit`, or as `git yogit`.",
   "type": "module",
   "bin": {
-    "git-bell": "bell.mjs"
+    "yogit": "yogit.mjs",
+    "git-yogit": "yogit.mjs"
   },
   "files": [
-    "bell.mjs",
+    "yogit.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -25,16 +26,16 @@
     "git",
     "mailbox",
     "cli",
-    "git-bell",
+    "yogit",
     "i5h"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YoAm/git-bell.git"
+    "url": "git+https://github.com/YoAm/yogit.git"
   },
-  "homepage": "https://github.com/YoAm/git-bell#readme",
+  "homepage": "https://github.com/YoAm/yogit#readme",
   "bugs": {
-    "url": "https://github.com/YoAm/git-bell/issues"
+    "url": "https://github.com/YoAm/yogit/issues"
   }
 }
