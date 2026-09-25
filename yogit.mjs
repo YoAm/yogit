@@ -184,17 +184,24 @@ function slug(s) {
     .replace(/^[^a-z0-9]+/, '').slice(0, 64).replace(/[^a-z0-9]+$/, '');
 }
 
-// Only what an agent sets for the commands it runs counts. Settings people
-// export in their shell rc (CLAUDE_CODE_USE_BEDROCK, CODEX_HOME, ...) would
-// otherwise rename a human in a plain terminal and let them ack an agent's mail.
-const CODEX_SETTINGS = /^CODEX_(HOME|SQLITE_HOME|API_KEY|ACCESS_TOKEN|CA_CERTIFICATE|CONNECTORS_TOKEN|GITHUB_PERSONAL_ACCESS_TOKEN|MANAGED_.*)$/;
-
+// Only what an agent sets for the commands it runs counts, and only the
+// variables listed here, in this order. Settings people export in their shell
+// rc (CLAUDE_CODE_USE_BEDROCK, CODEX_HOME, CURSOR_API_KEY, ...) would otherwise
+// rename a human in a plain terminal and let them ack an agent's mail, so an
+// unknown variable leaves you yourself. CURSOR_TRACE_ID comes last: Cursor
+// sets it in its terminal, where people and other agents run too.
+const AGENT_VARIABLES = [
+  ['claude', 'CLAUDECODE'], ['claude', 'CLAUDE_CODE_ENTRYPOINT'],
+  ['codex', 'CODEX_THREAD_ID'], ['codex', 'CODEX_SANDBOX'], ['codex', 'CODEX_SANDBOX_NETWORK_DISABLED'], ['codex', 'CODEX_CI'],
+  ['cursor', 'CURSOR_AGENT'],
+  ['gemini', 'GEMINI_CLI'],
+  ['agy', 'ANTIGRAVITY_AGENT'],
+  ['cursor', 'CURSOR_TRACE_ID'],
+];
+// The agent this process runs inside, and the variable that says so: { name, variable }, or null.
 function detectAgent(env) {
-  const keys = Object.keys(env).filter((k) => env[k]);
-  if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return 'claude';
-  if (keys.some((k) => k.startsWith('CODEX_') && !CODEX_SETTINGS.test(k))) return 'codex';
-  if (keys.some((k) => k.startsWith('CURSOR_'))) return 'cursor';
-  return '';
+  for (const [name, variable] of AGENT_VARIABLES) if (env[variable]) return { name, variable };
+  return null;
 }
 
 // Precedence: --as, $BELL_AS, $YOGIT_AS, git config bell.name, agent environment, git user.name.
@@ -207,7 +214,7 @@ function whoAmI(opts) {
   const configured = gitConfig('bell.name');
   if (configured) return checkName(configured, 'git config bell.name');
   const agent = detectAgent(process.env);
-  if (agent) return agent;
+  if (agent) return agent.name;
   const fromUser = slug(gitConfig('user.name'));
   if (fromUser && isToken(fromUser) && fromUser !== BROADCAST) return fromUser;
   throw new BellError('cannot tell who you are. Pass --as <name>, set BELL_AS (or YOGIT_AS), or run: git config bell.name <name>', 2, 'no-identity');
@@ -1847,7 +1854,7 @@ usage: yogit <command> [arguments] [--as <name>]
 try:  yogit send codex "tests are green"      then, as codex:  yogit ring; yogit read
 
 Who you are: --as, then $BELL_AS (or $YOGIT_AS), then \`git config bell.name\`,
-then the agent you run inside (claude, codex, cursor), then your git user.name.
+then the agent you run inside (claude, codex, cursor, gemini, agy), then your git user.name.
 Ids can be shortened to any unique prefix or suffix. Quote message text:
 --subject, --kind, --sign and --as are read anywhere, and any other option inside
 the text is refused, never silently dropped. Text after -- is always text.

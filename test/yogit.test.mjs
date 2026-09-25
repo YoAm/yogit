@@ -273,13 +273,29 @@ test('identity precedence: --as, BELL_AS, YOGIT_AS, bell.name, agent env, user.n
   assert.equal(whoSends([], agents), 'claude');
   assert.equal(whoSends([], { CLAUDE_CODE_ENTRYPOINT: 'cli' }), 'claude');
 
+  // Only variables an agent sets for the commands it runs count, in a fixed order.
+  assert.equal(whoSends([], { CURSOR_AGENT: '1' }), 'cursor');
+  assert.equal(whoSends([], { CODEX_SANDBOX_NETWORK_DISABLED: '1' }), 'codex');
+  assert.equal(whoSends([], { CODEX_CI: '1' }), 'codex');
+  assert.equal(whoSends([], { GEMINI_CLI: '1' }), 'gemini');
+  assert.equal(whoSends([], { ANTIGRAVITY_AGENT: '1' }), 'agy');
+  assert.equal(whoSends([], { CLAUDECODE: '1', GEMINI_CLI: '1' }), 'claude', 'claude keeps its priority');
+  // CURSOR_TRACE_ID is inherited by anything started in Cursor's terminal, so it counts last.
+  assert.equal(whoSends([], { GEMINI_CLI: '1', CURSOR_TRACE_ID: 'x' }), 'gemini');
+  assert.equal(whoSends([], { ANTIGRAVITY_AGENT: '1', CURSOR_TRACE_ID: 'x' }), 'agy');
+
   // Settings people export in their shell rc are not an agent at work.
-  for (const [key, value] of [['CLAUDE_CODE_USE_BEDROCK', '1'], ['CODEX_HOME', '/x/.codex'], ['CODEX_API_KEY', 'k'], ['CODEX_MANAGED_BY_NPM', '1']]) {
+  const settings = [
+    ['CLAUDE_CODE_USE_BEDROCK', '1'], ['CODEX_HOME', '/x/.codex'], ['CODEX_API_KEY', 'k'], ['CODEX_MANAGED_BY_NPM', '1'],
+    ['CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT', '1'], ['CODEX_OSS_BASE_URL', 'http://localhost:11434'], ['CURSOR_API_KEY', 'k'],
+  ];
+  for (const [key, value] of settings) {
     assert.equal(whoSends([], { [key]: value }), 'ada-lovelace', `${key} alone must not rename a human`);
   }
 
   sb.git(repo, 'config', 'bell.name', 'Zed');
   assert.equal(whoSends([], agents), 'zed', 'git config beats the agent env (and names are lowercased)');
+  assert.equal(whoSends([], { GEMINI_CLI: '1', ANTIGRAVITY_AGENT: '1', CURSOR_AGENT: '1', CODEX_CI: '1' }), 'zed', 'every agent variable');
   assert.equal(whoSends([], { ...agents, YOGIT_AS: 'from-yogit-env' }), 'from-yogit-env', 'YOGIT_AS is accepted too');
   assert.equal(whoSends([], { ...agents, BELL_AS: 'from-env', YOGIT_AS: 'from-yogit-env' }), 'from-env', 'BELL_AS wins over YOGIT_AS');
   assert.equal(whoSends([], { ...agents, GIT_BELL_AS: 'from-old-env' }), 'from-old-env', 'GIT_BELL_AS, from before the rename, still counts');
