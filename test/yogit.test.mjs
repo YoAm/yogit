@@ -263,6 +263,8 @@ test('identity precedence: --as, BELL_AS, YOGIT_AS, bell.name, agent env, user.n
   assert.equal(none.code, 2);
   assert.match(none.err, /cannot tell who you are/);
   assert.match(none.err, /YOGIT_AS/);
+  assert.match(none.err, /yogit name <name>/, 'the hint names one worktree, not the whole repo');
+  assert.doesNotMatch(none.err, /git config bell\.name/, 'a shared bell.name outranks every agent in every worktree');
 
   sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
   assert.equal(whoSends([], {}), 'ada-lovelace');
@@ -394,6 +396,98 @@ test('two worktrees of one repo share the same mailbox', () => withSandbox((sb) 
   assert.equal(sb.bell(main, ['ring', '--as', 'codex']).out, '', 'the read in one worktree is seen in the other');
   sb.bell(other, ['reply', id, 'hello from the other one', '--as', 'codex']);
   assert.match(sb.bell(main, ['inbox', '--as', 'claude']).out, /1 unread for claude/);
+}));
+
+test('yogit name scopes a name to one worktree, even in a repo that has only one so far', () => withSandbox((sb) => {
+  const CLAUDE = { CLAUDECODE: '1' };
+  const shared = (repo) => sb.gitWith(repo, ['config', '--list', '--show-origin']);
+  const scopeOf = (cwd) => spawnSync('git', ['config', '--show-scope', '--get', 'bell.name'], { cwd, env: sb.baseEnv, encoding: 'utf8' }).stdout.trim();
+
+  // Positive control: without the extension, git writes a "worktree" value into the shared config.
+  const control = sb.repo('control');
+  sb.git(control, 'config', '--worktree', 'bell.name', 'leaky');
+  assert.equal(scopeOf(control), 'local\tleaky', 'git config --worktree alone is shared in a one-worktree repo');
+
+  // (1) The leak case: one worktree, then a second one is added later.
+  const a = sb.repo('a', { commit: true });
+  const named = sb.bell(a, ['name', 'solo']);
+  assert.equal(named.code, 0, named.err);
+  assert.match(named.out, /extensions\.worktreeConfig/, 'it says it turned the extension on');
+  assert.match(named.out, /everyone who runs yogit here/, 'and that the name covers agents in this worktree too');
+  // (2) The name is in this worktree's own config, not the shared one.
+  assert.equal(scopeOf(a), 'worktree\tsolo');
+  assert.equal(spawnSync('git', ['config', '--file', join(a, '.git', 'config'), '--get', 'bell.name'], { env: sb.baseEnv }).status, 1);
+  const b = join(sb.dir, 'b');
+  sb.git(a, 'worktree', 'add', '-q', b);
+  // git (2.36 and later) copies the source worktree's config.worktree into a new worktree, so b
+  // starts as a copy of a's name. yogit wrote nothing there, and says so when it names a worktree.
+  assert.match(sb.bell(b, ['who'], { env: CLAUDE }).out, /you are solo \(git config --worktree bell\.name\)/, 'a worktree added FROM a named one starts with a copy');
+  assert.match(named.out, /git worktree add run from here/, 'yogit name warns about that copy');
+  assert.match(sb.bell(b, ['name', '--unset'], { env: CLAUDE }).out, /you are claude \(detected: CLAUDECODE\)/, '--unset in the copy brings detection back');
+  const c = join(sb.dir, 'c');
+  sb.git(b, 'worktree', 'add', '-q', c);
+  assert.match(sb.bell(c, ['who'], { env: CLAUDE }).out, /you are claude \(detected: CLAUDECODE\)/, 'a worktree added from an unnamed one inherits nothing: the shared config holds no name');
+  assert.doesNotMatch(sb.bell(a, ['name', 'solo-2']).out, /extensions\.worktreeConfig/, 'the extension is only turned on once');
+
+  // (3) Two worktrees, two Claudes.
+  assert.equal(sb.bell(a, ['name', 'claude-parser']).code, 0);
+  sentId(sb.bell(a, ['send', 'codex', 'from a'], { env: CLAUDE }));
+  sentId(sb.bell(b, ['send', 'codex', 'from b'], { env: CLAUDE }));
+  assert.deepEqual(inboxJson(sb, a, 'codex').messages.map((m) => m.from).sort(), ['claude', 'claude-parser']);
+  // (4) No argument: the name, and where it comes from.
+  assert.match(sb.bell(a, ['name']).out, /you are claude-parser \(git config --worktree bell\.name\)/);
+  // (5) --unset brings detection back; a second --unset is a no-op.
+  const unset = sb.bell(a, ['name', '--unset'], { env: CLAUDE });
+  assert.equal(unset.code, 0, unset.err);
+  assert.match(unset.out, /you are claude \(detected: CLAUDECODE\)/);
+  assert.equal(sb.bell(a, ['name', '--unset']).code, 0, 'nothing to unset is not an error');
+  assert.match(sb.bell(a, ['name', '--unset']).out, /no name of its own/);
+  // (6) A bad name changes nothing.
+  const before = shared(a);
+  assert.equal(sb.bell(a, ['name', '../x']).code, 2);
+  assert.equal(shared(a), before);
+
+  // A repo that already followed the old advice: a shared bell.name.
+  const old = sb.repo('old', { commit: true });
+  const oldB = join(sb.dir, 'old-b');
+  sb.git(old, 'worktree', 'add', '-q', oldB);
+  sb.git(old, 'config', 'bell.name', 'dana');
+  const fix = sb.bell(old, ['name', 'solo']);
+  assert.equal(fix.code, 0, fix.err);
+  assert.match(fix.out, /git config --local bell\.name dana still names every other worktree/);
+  assert.match(fix.out, /git config --local --unset bell\.name/);
+  assert.match(sb.bell(oldB, ['name']).out, /you are dana \(git config --local bell\.name\)/, 'the other worktree is unchanged');
+  const back = sb.bell(old, ['name', '--unset']);
+  assert.match(back.out, /you are dana \(git config --local bell\.name\)/, '--unset says which name applies now');
+  assert.equal(sb.bell(old, ['name', '--unset']).code, 0);
+
+  // (7) core.worktree in the shared config has to move before the extension goes on: refused, unchanged.
+  const moved = sb.repo('moved', { commit: true });
+  sb.git(moved, 'config', 'core.worktree', moved);
+  sb.git(moved, 'config', 'bell.name', 'dana');
+  const pinned = shared(moved);
+  const refused = sb.bell(moved, ['name', 'solo']);
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /core\.worktree/);
+  assert.match(refused.err, /config\.worktree core\.worktree/, 'with the git commands that move it');
+  assert.equal(shared(moved), pinned);
+  const bare = join(sb.dir, 'bare.git');
+  sb.git(sb.dir, 'init', '-q', '--bare', bare);
+  assert.equal(sb.bell(bare, ['name', 'solo']).code, 1, 'a bare repo has no worktree to name');
+}));
+
+test('who says where your name comes from, and lists names given to other worktrees', () => withSandbox((sb) => {
+  const a = sb.repo('a', { commit: true });
+  const b = join(sb.dir, 'b');
+  sb.git(a, 'worktree', 'add', '-q', b);
+  assert.match(sb.bell(a, ['who']).out, /you have no name here yet - yogit name <name>/);
+  assert.match(sb.bell(a, ['who'], { env: { CLAUDECODE: '1' } }).out, /you are claude \(detected: CLAUDECODE\)/);
+  assert.match(sb.bell(a, ['who', '--as', 'x']).out, /you are x \(--as\)/);
+  assert.match(sb.bell(a, ['who'], { env: { YOGIT_AS: 'y' } }).out, /you are y \(YOGIT_AS\)/);
+  assert.equal(sb.bell(b, ['name', 'claude-parser']).code, 0);
+  const who = sb.bell(a, ['who'], { env: { CODEX_THREAD_ID: 't' } });
+  assert.match(who.out, /claude-parser .*sent 0, received 0/, 'a peer can find a name before it has sent anything');
+  assert.match(who.out, /you are codex \(detected: CODEX_THREAD_ID\)/);
 }));
 
 test('sync between two clones through a bare remote', () => withSandbox((sb) => {
