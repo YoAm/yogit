@@ -239,6 +239,9 @@ const AGENT_VARIABLES = [
   ['agy', 'ANTIGRAVITY_AGENT'],
   ['cursor', 'CURSOR_TRACE_ID'],
 ];
+// Names an agent takes without being told, so nobody needs to introduce them.
+const AGENT_NAMES = ['claude', 'codex', 'cursor', 'gemini', 'agy', 'aider'];
+
 // The agent this process runs inside, and the variable that says so: { name, variable }, or null.
 function detectAgent(env) {
   for (const [name, variable] of AGENT_VARIABLES) if (env[variable]) return { name, variable };
@@ -1045,6 +1048,30 @@ function preview(m) {
   return kind + (m.subject ? oneLine(m.subject, 60) : oneLine(m.body, 60));
 }
 
+// Edit distance, for "did you mean": small inputs only (names, commands, options).
+function distance(a, b) {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    row = next;
+  }
+  return row[b.length];
+}
+
+// The closest candidate within two edits, or ''.
+function closest(word, candidates) {
+  let best = '';
+  let bestDistance = 3;
+  for (const c of candidates) {
+    const d = distance(word, c);
+    if (d > 0 && d < bestDistance) [best, bestDistance] = [c, d];
+  }
+  return best;
+}
+
 function plural(n, word) {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
@@ -1058,6 +1085,35 @@ function readText(words) {
 
 const audience = (to) => (to === BROADCAST ? 'everyone (all)' : to);
 
+// Every name this mailbox has seen: senders, recipients, readers, whoever
+// acted on a letter, and names worktrees gave themselves.
+function knownNames(box) {
+  const names = new Set();
+  for (const m of [...box.messages, ...box.hidden.map((d) => d.letter).filter(Boolean)]) names.add(m.from).add(m.to);
+  for (const d of [...box.delivered, ...box.skipped]) names.add(d.to);
+  for (const t of box.tombs.values()) {
+    names.add(t.from).add(t.to);
+    for (const e of t.trail) names.add(e.actor);
+  }
+  for (const events of box.byMsg.values()) for (const e of events) names.add(e.to).add(e.actor);
+  for (const reader of box.acks.keys()) names.add(reader);
+  for (const { name } of worktreeNames()) names.add(name);
+  names.delete(BROADCAST);
+  return names;
+}
+
+// A letter to a name nobody has used goes to an inbox nobody reads: say so,
+// and suggest the name that was probably meant. Delivery is unchanged.
+function newcomerNote(recipient, me) {
+  if (recipient === BROADCAST || recipient === me || AGENT_NAMES.includes(recipient)) return '';
+  const known = knownNames(loadMailbox());
+  if (known.has(recipient)) return '';
+  const listed = [...known].sort();
+  const shown = listed.length ? ` (known: ${listed.slice(0, 8).join(', ')}${listed.length > 8 ? ', ...' : ''})` : '';
+  const guess = closest(recipient, new Set([...known, ...AGENT_NAMES]));
+  return `note: ${recipient} is new to this mailbox${shown}${guess ? ` - did you mean ${guess}?` : ''}`;
+}
+
 async function cmdSend(opts, [to, ...words]) {
   if (to === undefined) throw usage('usage: yogit send <to> <text...> [--subject s] [--kind k] [--sign]   (to "all" broadcasts)');
   const recipient = checkName(to, 'recipient', { allowBroadcast: true });
@@ -1065,8 +1121,10 @@ async function cmdSend(opts, [to, ...words]) {
   const kind = checkKind(opts.kind);
   requireRepo();
   const me = whoAmI(opts);
+  const note = newcomerNote(recipient, me);
   const msg = writeMessage({ from: me, to: recipient, subject: opts.subject ?? '', body: readText(words), kind, sign: opts.sign });
   console.log(`yogit: sent ${msg.id} to ${audience(recipient)}`);
+  if (note) warn(note);
   await ring(msg);
 }
 

@@ -191,6 +191,23 @@ test('short ids: the start of the 6-hex end works too, after prefix and suffix, 
   assert.match(missing.err, /e\.g\. [0-9a-f]{6}\b/, 'the error shows a real short id to copy');
 }));
 
+test('send notes a name nobody has used yet, and suggests the one you probably meant', () => withSandbox((sb) => {
+  const repo = sb.repo('repo', { commit: true });
+  assert.equal(sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']).err, '', 'an agent name needs no introduction, even in an empty mailbox');
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const typo = sb.bell(repo, ['send', 'claud', 'hi', '--as', 'codex']);
+  assert.equal(typo.code, 0, 'the letter is still delivered');
+  assert.match(typo.out, /^yogit: sent \S+ to claud$/m);
+  assert.match(typo.err, /claud is new to this mailbox \(known: claude, codex\) - did you mean claude\?/);
+  assert.equal(sb.bell(repo, ['send', 'claud', 'again', '--as', 'codex']).err, '', 'once used, a name is known');
+  const bob = sb.bell(repo, ['send', 'bob', 'hi', '--as', 'codex']);
+  assert.match(bob.err, /bob is new to this mailbox/);
+  assert.doesNotMatch(bob.err, /did you mean/, 'nothing close enough to suggest');
+  assert.equal(sb.bell(repo, ['name', 'parser-bot']).code, 0);
+  assert.equal(sb.bell(repo, ['send', 'parser-bot', 'hi', '--as', 'codex']).err, '', 'a worktree that named itself is known');
+  assert.equal(sb.bell(repo, ['send', 'all', 'hi', '--as', 'codex']).err, '');
+}));
+
 test('kind: defaults to "msg", --kind sets it, and it is shown', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   const id = sentId(sb.bell(repo, ['send', 'codex', 'can', 'you', 'look', '--kind', 'ASK', '--as', 'claude']));
