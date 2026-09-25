@@ -293,6 +293,10 @@ git-bell is a deliberately small take on an idea several projects explored first
 
 Thank you to all of them.
 
+## Dedication
+
+git-bell is a birthday present. Run `git bell about` in a terminal to see the dedication beside a little ASCII bell, and to hear the other kind of bell.
+
 ## Develop
 
 `npm test` runs `node --test`, offline, in throwaway repos under your temp dir:
@@ -300,7 +304,5 @@ Thank you to all of them.
 ```sh
 npm test
 ```
-
-git-bell is a birthday present. Run `git bell about` in a terminal to see the dedication beside a little ASCII bell, and to hear the other kind of bell.
 
 MIT licensed. See [LICENSE](LICENSE).
