@@ -1845,6 +1845,47 @@ test('the README 60-second demo runs as written, in one shell, and never leaves 
   assert.match(r.stdout, /^yogit: 1 sent by claude\n  \d{8}-\d{6}-[0-9a-f]{6}  -> codex  read  heads up\n$/m, 'the outbox ends it: codex has read the note');
 }));
 
+test('README quickstart: five lines at most, install first, and the yogit lines run as written', { skip: !hasBash && 'bash not found' }, () => withSandbox((sb) => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const after = readme.split(/^## Quickstart\s*$/m)[1];
+  assert.ok(after !== undefined, 'a Quickstart section');
+  const block = after.match(/^```sh\n([\s\S]*?)^```$/m)[1];
+  const lines = block.split('\n').filter((l) => l.trim());
+  assert.ok(lines.length <= 5, `at most 5 commands: ${lines.length}`);
+  assert.equal(lines[0], 'npm i -g @yoam/yogit');
+  assert.ok(!lines.some((l) => /--as|YOGIT_AS|BELL_AS/.test(l)), 'the quickstart never acts as an agent in your real repo');
+  // Run it: the npm line skipped, yogit on PATH, a throwaway HOME, stdin not a terminal (so init only shows its plan).
+  const bin = pinnedPath(sb);
+  const repo = sb.repo('mine');
+  sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
+  const bash = spawnSync('sh', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+  const r = spawnSync(bash, ['-e', '-c', lines.filter((l) => !l.startsWith('npm ')).join('\n')], { cwd: repo, env: { ...sb.baseEnv, PATH: bin }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^yogit init - you are ada-lovelace/m);
+  assert.match(r.stdout, /^yogit: sent \S+ to codex$/m);
+  assert.match(r.stdout, /-> codex {2}sent {2}tests are green$/m, 'the outbox shows the note waiting for codex');
+}));
+
+test('README: the commands table lists every command in help, and the old advice is gone', () => withSandbox((sb) => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const table = readme.split(/^## Commands\s*$/m)[1].split(/^## /m)[0];
+  const help = sb.bell(sb.dir, ['help']).out;
+  const commands = [...help.matchAll(/^ {2}([a-z][a-z0-9-]*)\b/gm)].map((m) => m[1]);
+  assert.ok(commands.length >= 20, commands.join(' '));
+  for (const cmd of commands) assert.ok(table.includes(`\`yogit ${cmd}`), `the Commands table has yogit ${cmd}`);
+  assert.ok(table.includes('| `yogit` |'), 'and bare yogit');
+  for (const gone of ['command -v yogit', 'run: git config bell.name']) {
+    assert.ok(!readme.includes(gone), `the README no longer says ${JSON.stringify(gone)}`);
+  }
+  const demo = README_SH.filter((b) => /yogit-demo/.test(b));
+  assert.match(demo[1], /^cd \.\.\/yogit-demo-codex &&/, 'terminal 2 stops if the cd fails, before anything runs in your own repo');
+  assert.match(demo[2], /^cd \.\.\/yogit-demo &&/);
+  assert.ok(!demo.join('\n').includes('BELL_AS'), 'the demo uses YOGIT_AS');
+  assert.match(readme, /YOGIT_AS=aider aider/);
+  assert.match(readme, /GEMINI_CLI/);
+  assert.match(readme, /ANTIGRAVITY_AGENT/);
+}));
+
 // ---------------------------------------------------------------- 2.1: message lifecycle
 
 const statusJson = (sb, cwd, id) => {

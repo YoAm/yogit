@@ -2255,7 +2255,7 @@ const RING_SETUP = {
     '# If your tool exposes a CLI to post to a live session, plug it in here:',
     `#   git config bell.ring.claude '${JSON.stringify(['your-cli', '--session', 'YOUR-SESSION', '--message', '{notice}'])}'`,
     '#',
-    '# What works in Claude Code today: `yogit hooks claude` rings at session start, and',
+    '# What works in Claude Code today: `yogit init claude` rings at session start, and',
     '# Claude can run `yogit watch` with its Monitor tool to hear new mail mid-session.',
   ],
 };
@@ -3013,15 +3013,16 @@ usage: yogit <command> [arguments] [--as <name>]
   version                            print the version (also --version)
   about                              version and dedication
 
-try:  yogit send codex "tests are green"      then, as codex:  yogit ring; yogit read
+start: yogit init      then: yogit send codex "tests are green"; yogit outbox
 
 Who you are: --as, then $YOGIT_AS (or $BELL_AS, its older name, which wins if both
 are set), then \`git config bell.name\` (set it per worktree with \`yogit name\`), then
 the agent you run inside (claude, codex, cursor, gemini, agy), then your git user.name.
+\`yogit who\` and \`yogit doctor\` say which rule named you.
 Ids can be shortened to any unique prefix or suffix, or the start of the 6-hex end
-(yogit read 7b4c). Quote message text:
---subject, --kind, --sign and --as are read anywhere, and any other option inside
-the text is refused, never silently dropped. Text after -- is always text.
+(yogit read 7b4c). Quote message text: --subject, --kind, --sign and --as are read
+anywhere, and any other option inside the text is refused, never silently dropped.
+Text after -- is always text.
 Receipts: \`git config bell.receipts false\` keeps your delivered and read receipts in
 this clone (acked always syncs).
 Help: yogit help, or yogit --help (\`git yogit --help\` makes git look for a man page).
