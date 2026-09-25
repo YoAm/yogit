@@ -17,8 +17,9 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { accessSync, constants, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const VERSION = '2.2.0';
@@ -283,6 +284,9 @@ const NO_NAME_YET = 'you have no name here yet - yogit name <name>';
 // Who you are, and why: { name, source, scope?, variable? }. source is what
 // `who` and `doctor` print: "--as", "YOGIT_AS", "git config --worktree
 // bell.name", "detected: CLAUDECODE", "git user.name".
+// Every agent variable that is set, in AGENT_VARIABLES order: [[name, variable], ...].
+const agentVariablesSet = (env) => AGENT_VARIABLES.filter(([, variable]) => env[variable]);
+
 // Precedence: --as, $BELL_AS, $YOGIT_AS, git config bell.name, agent environment, git user.name.
 // $GIT_BELL_AS, YOGIT_AS's name from before the rename to yogit, still counts, last of the three.
 function identify(opts, env = process.env) {
@@ -859,11 +863,12 @@ function ringTargets(msg) {
   return ringConfig('^bell\\.ring\\.').filter(([name]) => isCanonical(name) && name !== msg.from && name !== BROADCAST);
 }
 
+const ringTimeoutOk = (raw) => Number.isFinite(Number(raw)) && Number(raw) >= 0.1 && Number(raw) <= 120;
+
 function ringSeconds() {
   const raw = gitConfig('bell.ringTimeout');
   if (!raw) return RING_SECONDS;
-  const n = Number(raw);
-  if (Number.isFinite(n) && n >= 0.1 && n <= 120) return n;
+  if (ringTimeoutOk(raw)) return Number(raw);
   warn(`ignoring git config bell.ringTimeout=${sanitize(raw)}: use a number of seconds from 0.1 to 120 (using ${RING_SECONDS})`);
   return RING_SECONDS;
 }
@@ -891,16 +896,22 @@ function stopRingsAndExit(signal) {
   process.exit(128 + STOP_SIGNALS[signal]);
 }
 
-function ringOne(name, spec, msg, seconds) {
+// A bell.ring.<name> value as the argv it starts, or null if it is not a JSON array of strings.
+function ringArgv(spec) {
   let argv = null;
   try {
     argv = JSON.parse(spec);
   } catch {
-    // reported below
+    return null;
   }
   const valid = Array.isArray(argv) && argv.length > 0 && argv.length <= 64 && argv[0] !== ''
     && argv.every((a) => typeof a === 'string' && a.length <= 4096 && !a.includes('\0'));
-  if (!valid) {
+  return valid ? argv : null;
+}
+
+function ringOne(name, spec, msg, seconds) {
+  let argv = ringArgv(spec);
+  if (!argv) {
     warn(`ignoring git config bell.ring.${name}: it must be a JSON array of strings, such as ["program", "--flag", "{notice}"]`);
     return Promise.resolve(false);
   }
@@ -2026,6 +2037,128 @@ const HOOK_GONE = 'yogit: this hook names a node or yogit.mjs that is gone (run:
 const hookCommandFor = (node, script) => `if test -x ${shq(node)} && test -f ${shq(script)}; then exec ${shq(node)} ${shq(script)} ring; else echo ${shq(HOOK_GONE)} >&2; fi`;
 const hookCommand = () => hookCommandFor(nodePath(), scriptPath());
 
+// The node and yogit.mjs paths of a hook command hookCommandFor wrote, or
+// null for any other command: a hand-written `yogit ring` is never taken for
+// one init wrote, so init never rewrites it and --undo never removes it.
+const QWORD = String.raw`(?:[A-Za-z0-9_./+-]+|'[^']*'(?:\\''[^']*')*)`;
+const WORD = `(${QWORD})`;
+const HOOK_FORM = new RegExp(`^if test -x ${WORD} && test -f ${WORD}; then exec ${WORD} ${WORD} ring; else echo .+ >&2; fi$`);
+const unquote = (word) => (word.startsWith("'") ? word.slice(1, -1).replaceAll("'\\''", "'") : word);
+
+function hookPaths(command) {
+  const m = typeof command === 'string' ? command.match(HOOK_FORM) : null;
+  if (!m || m[1] !== m[3] || m[2] !== m[4]) return null;
+  const paths = { node: unquote(m[1]), script: unquote(m[2]) };
+  return hookCommandFor(paths.node, paths.script) === command ? paths : null;
+}
+
+// Does a hook command run yogit ring, in any form (yogit ring, git yogit ring, /path/yogit.mjs ring)?
+const runsRing = (command) => typeof command === 'string' && /(^|[\s/'"])(git[ -])?yogit(\.mjs)?['"]?\s+ring(?![\w-])/.test(command);
+
+// Are both paths of an init-written hook still there?
+function hookGone({ node, script }) {
+  const gone = [];
+  try {
+    accessSync(node, constants.X_OK);
+  } catch {
+    gone.push(node);
+  }
+  try {
+    statSync(script);
+  } catch {
+    gone.push(script);
+  }
+  return gone;
+}
+
+// ---------------------------------------------------------------- where integrations live
+
+const claudeDir = () => process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+const codexDir = () => process.env.CODEX_HOME || join(homedir(), '.codex');
+
+function worktreeTop() {
+  try {
+    return git(['rev-parse', '--show-toplevel']).trim();
+  } catch {
+    return ''; // a bare repo, or inside .git
+  }
+}
+
+// A path as people read it: relative to the worktree, or under ~.
+function shown(path, top) {
+  if (top && path.startsWith(`${top}${sep}`)) return relative(top, path);
+  const home = homedir();
+  if (home && path.startsWith(`${home}${sep}`)) return `~/${relative(home, path)}`;
+  return path;
+}
+
+// Claude Code's settings files, every scope of which runs its hooks.
+function claudeSettingsFiles(top) {
+  return [
+    ...(top ? [{ scope: 'local', path: join(top, '.claude', 'settings.local.json') }, { scope: 'project', path: join(top, '.claude', 'settings.json') }] : []),
+    { scope: 'user', path: join(claudeDir(), 'settings.json') },
+  ];
+}
+
+// A settings file: { exists, text, json } or { exists, text, error }. Strict
+// JSON only: a file with comments (JSONC) is not guessed at.
+function readSettings(path) {
+  let text;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT' ? { exists: false } : { exists: true, error: err.code || err.message };
+  }
+  if (!text.trim()) return { exists: true, text, json: {} };
+  try {
+    const json = JSON.parse(text);
+    if (json && typeof json === 'object' && !Array.isArray(json)) return { exists: true, text, json };
+    return { exists: true, text, error: 'not a JSON object' };
+  } catch {
+    return { exists: true, text, error: 'not strict JSON' };
+  }
+}
+
+// The SessionStart commands of a Claude settings object, in its nested shape:
+// hooks.SessionStart[] holds matcher groups, each with a hooks[] of { type, command }.
+function sessionStartHandlers(json) {
+  const found = [];
+  const groups = json?.hooks?.SessionStart;
+  if (!Array.isArray(groups)) return found;
+  for (const group of groups) {
+    if (!group || !Array.isArray(group.hooks)) continue;
+    for (const handler of group.hooks) if (handler && typeof handler.command === 'string') found.push({ group, handler, command: handler.command });
+  }
+  return found;
+}
+
+const BLOCK_BEGIN = '<!-- yogit:begin -->';
+const BLOCK_END = '<!-- yogit:end -->';
+
+// Every executable called name on PATH, in order.
+function onPath(name) {
+  const found = [];
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (statSync(candidate).isFile()) found.push(candidate);
+    } catch {
+      // not here
+    }
+  }
+  return found;
+}
+
+const realOrSame = (path) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+};
+
 // Each snippet goes to stdout and nothing else, so `> file` captures it whole;
 // the guidance follows on stderr. What agents read never tells them their name.
 const HOOKS = {
@@ -2120,6 +2253,253 @@ function cmdRingSetup(opts, [tool]) {
   console.log(lines.join('\n'));
 }
 
+// ---------------------------------------------------------------- doctor
+
+// Settings people export on purpose. They say nothing about an agent at work,
+// so doctor does not flag them as an agent it failed to recognise.
+const AGENT_SETTINGS = /^(CODEX_(HOME|SQLITE_HOME|API_KEY|ACCESS_TOKEN|CA_CERTIFICATE|CONNECTORS_TOKEN|GITHUB_PERSONAL_ACCESS_TOKEN|MANAGED_.*)|CURSOR_API_KEY)$/;
+const NAME_VARIABLES = ['BELL_AS', 'YOGIT_AS', 'GIT_BELL_AS'];
+const LOOSE_REFS = 2000;
+
+const versionAtLeast = (v, major, minor) => {
+  const [a, b] = v.split('.').map(Number);
+  return a > major || (a === major && b >= minor);
+};
+
+const configAll = (key) => {
+  try {
+    return git(['config', '--get-all', key]).split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
+// The local refs a fetch refspec writes (its right side), and the local refs
+// a push refspec sends (its left side). Negative refspecs write nothing.
+function refspecSide(spec, side) {
+  const s = spec.replace(/^\+/, '');
+  if (s.startsWith('^')) return '';
+  const colon = s.indexOf(':');
+  if (side === 'dst') return colon < 0 ? '' : s.slice(colon + 1);
+  return colon < 0 ? s : s.slice(0, colon);
+}
+
+// Does a ref pattern (refs/bell/*, refs/*, *) cover mail refs?
+function coversBell(pattern) {
+  if (!pattern) return false;
+  const star = pattern.indexOf('*');
+  if (star < 0) return pattern.startsWith('refs/bell/');
+  const prefix = pattern.slice(0, star);
+  return 'refs/bell/'.startsWith(prefix) || prefix.startsWith('refs/bell/');
+}
+
+const regexLiteral = (s) => `^${s.replace(/[\\^$.|?*+()[\]{}]/g, '\\$&')}$`;
+
+function countFiles(dir) {
+  let n = 0;
+  let entries = [];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) n += e.isDirectory() ? countFiles(join(dir, e.name)) : 1;
+  return n;
+}
+
+// doctor: why yogit behaves as it does here, offline and read-only. One line
+// per finding, ok|info|warn|fail, each warn or fail with the command that fixes
+// it; exit 1 only if something fails. It never prints a variable's value.
+function cmdDoctor(opts) {
+  const checks = [];
+  const report = (level, finding, fix = '') => checks.push({ level, finding: sanitize(finding), fix: sanitize(fix) });
+
+  // Versions, and which yogit runs.
+  const nodeVersion = process.versions.node;
+  let gitVersion = '';
+  try {
+    gitVersion = git(['--version']).match(/(\d+\.\d+(\.\d+)?)/)?.[1] ?? '';
+  } catch {
+    // reported below
+  }
+  const nodeOk = versionAtLeast(nodeVersion, 18, 0);
+  const gitOk = Boolean(gitVersion) && versionAtLeast(gitVersion, 2, 20);
+  if (nodeOk && gitOk) report('ok', `node ${nodeVersion}, git ${gitVersion}`);
+  if (!nodeOk) report('fail', `node ${nodeVersion} is older than 18`, 'install node 18 or later');
+  if (!gitOk) report('fail', gitVersion ? `git ${gitVersion} is older than 2.20` : 'git was not found on PATH', 'install git 2.20 or later');
+  const self = scriptPath();
+  if (self.split(sep).includes('_npx')) report('warn', `yogit runs from npx's cache (${self}), which npm may clear`, 'npm i -g @yoam/yogit');
+  const [pathYogit] = onPath('yogit');
+  const [pathGitYogit] = onPath('git-yogit');
+  if (!pathYogit) report('warn', 'yogit is not on PATH, so an agent or a hook that runs `yogit ring` cannot find it', 'npm i -g @yoam/yogit (yogit init writes hooks that name yogit by path)');
+  else if (realOrSame(pathYogit) !== self) report('warn', `yogit on PATH is another copy: ${pathYogit} (this one is ${self})`, 'npm i -g @yoam/yogit, or remove the other copy');
+  else report('ok', `yogit on PATH is this copy (${VERSION}, ${self})`);
+  if (pathYogit && pathGitYogit && realOrSame(pathYogit) !== realOrSame(pathGitYogit)) {
+    report('warn', `yogit and git yogit run different copies: ${pathYogit} and ${pathGitYogit}`, 'npm i -g @yoam/yogit, or remove the other copy');
+  }
+
+  // The repo.
+  const repo = inRepo();
+  const top = repo ? worktreeTop() : '';
+  const trees = repo ? worktreePaths() : [];
+  if (!repo) report('warn', 'not inside a git repository, so only your user-wide setup is checked', 'cd <repo>, or git init');
+  else report('ok', `repo ${top || commonDir()}: ${plural(trees.length, 'worktree')}, extensions.worktreeConfig ${configTrue('extensions.worktreeConfig', ['--local']) ? 'on' : 'off'}`);
+
+  // Who you are, and what could make that wrong.
+  let id = null;
+  try {
+    id = identifyOrNull(opts);
+    if (id) report('ok', youAre(id));
+    else report('fail', 'no name here: yogit refuses to send or read, and ring stays quiet', 'yogit name <name>');
+  } catch (err) {
+    if (!(err instanceof BellError)) throw err;
+    report('fail', err.message, 'yogit name <name>, or fix the value it names');
+  }
+  const agents = agentVariablesSet(process.env);
+  const agent = agents.length ? { name: agents[0][0], variable: agents[0][1] } : null;
+  if (new Set(agents.map(([name]) => name)).size > 1) {
+    report('warn', `variables of more than one agent are set (${agents.map(([, v]) => v).join(', ')}): one runs inside another, and ${agent.variable} wins, so this is ${agent.name}`, 'start the inner one with YOGIT_AS=<its name>, or pass --as');
+  }
+  if (id && agent && NAME_VARIABLES.includes(id.source)) {
+    report('warn', `${id.source} is set, so ${agent.variable} (${agent.name}) is ignored: every agent started from this shell is ${id.name}`, `set ${id.source} for one process, not in a shell rc (unset ${id.source})`);
+  }
+  if (id && agent && 'scope' in id) {
+    const back = id.scope === 'worktree' ? 'yogit name --unset' : `git config ${id.scope ? `--${id.scope} ` : ''}--unset bell.name`;
+    if (id.name === agent.name || id.name.startsWith(`${agent.name}-`)) report('info', `${id.source} ${id.name} outranks ${agent.variable} (${agent.name})`);
+    else report('warn', `${id.source} ${id.name} outranks ${agent.variable} (${agent.name}): everyone who runs yogit here is ${id.name}`, `for one agent, YOGIT_AS=${id.name} on its launcher or --as; to go back to ${agent.name}: ${back}`);
+  }
+  if (!agent) {
+    const stray = Object.keys(process.env).filter((k) => process.env[k] && (k.startsWith('CODEX_') || k.startsWith('CURSOR_') || k === 'AI_AGENT') && !AGENT_SETTINGS.test(k)).sort();
+    if (stray.length) {
+      const guess = stray.some((k) => k.startsWith('CODEX_')) ? 'codex' : stray.some((k) => k.startsWith('CURSOR_')) ? 'cursor' : '<agent>';
+      report('warn', `${stray.join(', ')} ${stray.length === 1 ? 'is' : 'are'} set, but no agent yogit knows sets ${stray.length === 1 ? 'it' : 'them'}, so you are ${id?.name ?? 'unnamed'} here`, `if an agent runs this shell, start it with YOGIT_AS=${guess} (alias ${guess}='YOGIT_AS=${guess} ${guess}'), or pass --as ${guess}`);
+    }
+  }
+  const globalName = configScoped('bell.name', ['--global'])?.value;
+  if (globalName) report('warn', `git config --global bell.name ${globalName} names you in every repo, above agent detection, so every agent is ${globalName} too`, 'git config --global --unset bell.name, then yogit name <name> in the worktrees that need one');
+  if (repo) {
+    const localName = configScoped('bell.name', ['--local'])?.value;
+    if (localName && trees.length > 1) report('warn', `git config --local bell.name ${localName} names every worktree of this repo, above agent detection`, 'git config --local --unset bell.name, then yogit name <name> in each worktree that needs one');
+    const places = new Map();
+    for (const { path, name } of worktreeNames()) places.set(name, [...(places.get(name) ?? []), path]);
+    for (const [name, paths] of places) {
+      if (paths.length > 1) report('warn', `${name} names ${paths.length} worktrees (${paths.join(', ')}): git worktree add copies a worktree's name into the new one`, 'yogit name --unset (or yogit name <other>) in the copy');
+    }
+  }
+
+  // Remotes: a refspec that carries refs/bell goes around sync's checks, and a prune deletes unsynced mail.
+  const box = repo ? loadMailbox() : null;
+  if (repo) {
+    const remotes = git(['remote']).split('\n').filter(Boolean);
+    for (const r of remotes) {
+      let prune = configTrue('fetch.prune');
+      try {
+        prune = git(['config', '--type=bool', '--get', `remote.${r}.prune`]).trim() === 'true';
+      } catch {
+        // not set for this remote: fetch.prune decides
+      }
+      for (const spec of configAll(`remote.${r}.fetch`)) {
+        if (!coversBell(refspecSide(spec, 'dst'))) continue;
+        const fix = `git config --unset-all remote.${r}.fetch ${shq(regexLiteral(spec))} && yogit sync`;
+        if (prune) report('fail', `remote.${r}.fetch ${spec} fetches refs/bell around yogit sync, and with prune on, a plain git fetch deletes mail you have not synced`, fix);
+        else report('warn', `remote.${r}.fetch ${spec} fetches refs/bell around yogit sync (no mail-shape or tombstone checks), and git fetch -p or git pull --prune deletes mail you have not synced`, fix);
+      }
+      for (const spec of configAll(`remote.${r}.push`)) {
+        if (coversBell(refspecSide(spec, 'src'))) report('warn', `remote.${r}.push ${spec} pushes refs/bell on every git push, around yogit sync, and replaces what a plain git push sends`, `git config --unset-all remote.${r}.push ${shq(regexLiteral(spec))}`);
+      }
+      if (configTrue(`remote.${r}.mirror`)) report('warn', `remote.${r}.mirror is on: a git push sends every ref, mail included, and deletes remote refs this clone lacks`, `git config --unset remote.${r}.mirror`);
+    }
+    if (remotes.length && box.refs.size === 0) report('info', `no mail in this clone yet; ${remotes.includes('origin') ? 'origin' : remotes[0]} may have some`, 'yogit sync');
+  }
+
+  // Integrations: what rings, where, and whether it still can.
+  let wired = 0;
+  const claudeHooks = [];
+  for (const { scope, path } of claudeSettingsFiles(top)) {
+    const file = readSettings(path);
+    if (!file.exists) continue;
+    const where = shown(path, top);
+    if (file.error) {
+      if (file.text?.includes('yogit')) report('warn', `${where} is ${file.error}, so doctor cannot read its hooks and yogit init leaves it alone`);
+      continue;
+    }
+    for (const { command } of sessionStartHandlers(file.json)) {
+      if (!runsRing(command)) continue;
+      wired += 1;
+      claudeHooks.push(where);
+      const paths = hookPaths(command);
+      const gone = paths ? hookGone(paths) : [];
+      const refresh = scope === 'project' ? 'edit it (yogit hooks claude prints the command)' : `yogit init claude${scope === 'user' ? ' --user' : ''}`;
+      if (gone.length) report('fail', `${where}: the yogit hook names ${gone.join(' and ')}, which ${gone.length === 1 ? 'is' : 'are'} gone, so it rings nothing`, refresh);
+      else report('ok', `${where}: SessionStart runs yogit ring${paths ? ' (node and yogit by path)' : command === 'yogit ring' ? '' : ` (${command})`}`);
+    }
+  }
+  if (claudeHooks.length > 1) report('warn', `Claude Code runs the hooks of every scope, so it rings ${claudeHooks.length} times: ${claudeHooks.join(', ')}`, 'keep one: yogit init claude --undo, or yogit init claude --user --undo');
+  for (const path of [top && join(top, 'AGENTS.md'), join(codexDir(), 'AGENTS.md')].filter(Boolean)) {
+    let text = '';
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      continue;
+    }
+    if (text.includes(BLOCK_BEGIN) || /yogit ring/.test(text)) {
+      wired += 1;
+      report('ok', `${shown(path, top)}: tells Codex (and other agents that read AGENTS.md) to run yogit ring`);
+    }
+  }
+  if (top) {
+    const rule = join(top, '.cursor', 'rules', 'yogit.mdc');
+    let text = '';
+    try {
+      text = readFileSync(rule, 'utf8');
+    } catch {
+      // none
+    }
+    if (/yogit ring/.test(text)) {
+      wired += 1;
+      report('ok', `${shown(rule, top)}: tells Cursor to run yogit ring`);
+    }
+  }
+  for (const path of [top && join(top, '.codex', 'hooks.json'), join(codexDir(), 'hooks.json')].filter(Boolean)) {
+    try {
+      if (readFileSync(path, 'utf8').includes('yogit')) report('info', `${shown(path, top)} mentions yogit; whether Codex trusts that hook cannot be checked offline`);
+    } catch {
+      // none
+    }
+  }
+  if (wired === 0) report('info', 'no agent is set up to ring yogit at session start', 'yogit init');
+
+  // Mail.
+  if (repo) {
+    if (box.skipped.length) report('warn', `${plural(box.skipped.length, 'malformed letter')} under refs/bell/inbox, which yogit skips`, 'git for-each-ref refs/bell/inbox lists them; git update-ref -d <ref> removes one');
+    if (id) {
+      const unread = myMail(box, id.name).length;
+      report(unread ? 'info' : 'ok', unread ? `${unread} unread for ${id.name}` : `no unread mail for ${id.name}`, unread ? 'yogit inbox' : '');
+    }
+    const loose = countFiles(join(commonDir(), 'refs', 'bell'));
+    if (loose > LOOSE_REFS) report('warn', `${loose} loose ref files under refs/bell`, 'yogit gc');
+    const marks = [...box.acks.values()].reduce((n, ids) => n + ids.size, 0);
+    if (marks) report('info', `${plural(marks, '2.0 read mark')} under refs/bell/ack, read as read and acked`);
+  }
+
+  // The ring bridge.
+  for (const [name, spec] of ringConfig('^bell\\.ring\\.')) {
+    const argv = ringArgv(spec);
+    const program = argv?.[0] ?? '';
+    const found = program && (program.includes('/') ? hookGone({ node: program, script: program }).length === 0 : onPath(program).length > 0);
+    if (!argv) report('warn', `git config bell.ring.${name} is not a JSON array of strings, so that ring is skipped`, `git config bell.ring.${name} '["program", "arg", "{notice}"]'`);
+    else if (!found) report('warn', `bell.ring.${name} runs ${program}, which cannot be found`, 'install it, or give its absolute path');
+    else report('ok', `bell.ring.${name} rings with ${program}`);
+  }
+  const timeout = gitConfig('bell.ringTimeout');
+  if (timeout && !ringTimeoutOk(timeout)) report('warn', `git config bell.ringTimeout=${timeout} is not a number of seconds from 0.1 to 120`, 'git config bell.ringTimeout 10');
+
+  const failed = checks.some((c) => c.level === 'fail');
+  if (opts.json) console.log(JSON.stringify({ ok: !failed, checks }, null, 2));
+  else for (const c of checks) console.log(`${c.level.padEnd(4)} ${c.finding}${c.fix ? `  -> ${c.fix}` : ''}`);
+  process.exitCode = failed ? 1 : 0;
+}
+
 function cmdAbout() {
   const art = [
     '     .-.     ',
@@ -2184,6 +2564,7 @@ usage: yogit <command> [arguments] [--as <name>]
                                      has read it, then pack refs
   verify <id>                        is this letter signed, and is the signature valid?
   import-h5i                         copy an h5i refs/h5i/msg log into letters
+  doctor [--json]                    check your setup, offline: each finding with its fix
   hooks <claude|codex|cursor>        print a setup snippet for that agent
   ring-setup <claude|codex>          print how to ring a live session after each send
   version                            print the version (also --version)
@@ -2269,6 +2650,7 @@ const COMMANDS = {
   'import-h5i': cmdImportH5i,
   hooks: cmdHooks,
   'ring-setup': cmdRingSetup,
+  doctor: cmdDoctor,
   about: cmdAbout,
   version: () => console.log(`yogit ${VERSION}`),
 };
