@@ -493,6 +493,17 @@ test('ring is silent with no mail, and outside a repo', () => withSandbox((sb) =
   assert.match(inbox.err, /^yogit: not inside a git repository/);
 }));
 
+test('ring never fails a hook over a missing name, but a bad explicit name is still loud', () => withSandbox((sb) => {
+  const repo = sb.repo('repo'); // no user.name, and the sandbox passes no agent variables
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const ring = sb.bell(repo, ['ring']);
+  assert.equal(ring.code, 0, 'a SessionStart hook that exits non-zero shows an error every session');
+  assert.equal(ring.out, '');
+  assert.match(ring.err, /^yogit: ring: no name here yet \(run: yogit doctor\)\n$/);
+  assert.equal(sb.bell(repo, ['ring'], { env: { BELL_AS: '../x' } }).code, 2, 'a name the user set, and set wrong, is a configuration error');
+  assert.equal(sb.bell(repo, ['inbox']).code, 2, 'other commands still refuse to guess');
+}));
+
 test('a malformed message warns only its reader, and never through ring', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   sb.git(repo, 'update-ref', 'refs/bell/inbox/codex/bogus', sb.git(repo, 'hash-object', '-w', '--stdin'));

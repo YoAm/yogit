@@ -54,9 +54,10 @@ const PROGRESS = [STATES.SENT, STATES.RING_FAILED, STATES.NOTIFIED, STATES.RELAY
 // ---------------------------------------------------------------- errors
 
 class BellError extends Error {
-  constructor(message, code = 1) {
+  constructor(message, code = 1, reason = '') {
     super(message);
     this.code = code;
+    this.reason = reason; // for the few callers that act on one kind of error, never on its wording
   }
 }
 const usage = (message) => new BellError(message, 2);
@@ -209,7 +210,7 @@ function whoAmI(opts) {
   if (agent) return agent;
   const fromUser = slug(gitConfig('user.name'));
   if (fromUser && isToken(fromUser) && fromUser !== BROADCAST) return fromUser;
-  throw usage('cannot tell who you are. Pass --as <name>, set BELL_AS (or YOGIT_AS), or run: git config bell.name <name>');
+  throw new BellError('cannot tell who you are. Pass --as <name>, set BELL_AS (or YOGIT_AS), or run: git config bell.name <name>', 2, 'no-identity');
 }
 
 // ---------------------------------------------------------------- letters
@@ -1262,10 +1263,19 @@ function tryMarkDelivered(box, me) {
 }
 
 // Built for hooks: one line when there is mail, otherwise nothing at all.
-// Outside a git repo it stays silent too, so a global hook never nags.
+// Outside a git repo it stays silent too, so a global hook never nags. With
+// no name at all it says so on stderr and still exits 0: a hook that fails
+// shows an error at every session start. A name set wrong still fails.
 function cmdRing(opts) {
   if (!inRepo()) return;
-  const me = whoAmI(opts);
+  let me;
+  try {
+    me = whoAmI(opts);
+  } catch (err) {
+    if (!(err instanceof BellError) || err.reason !== 'no-identity') throw err;
+    process.stderr.write('yogit: ring: no name here yet (run: yogit doctor)\n');
+    return;
+  }
   const box = loadMailbox();
   tryMarkDelivered(box, me);
   const line = ringLine(box, me);
