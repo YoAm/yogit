@@ -761,18 +761,40 @@ function findMessage(box, rawId, me) {
   throw new BellError(`${tomb.msg} was deleted by ${actor} ${ts.slice(0, 10)} ${ts.slice(11, 16)} UTC (yogit status ${tomb.msg})`);
 }
 
+// Short ids match in tiers, so an id that resolved before never changes
+// meaning or turns ambiguous: a unique prefix or suffix of the full id, then,
+// only if that finds nothing, the start of its 6-hex end (people type "7b4c"
+// for 20260925-121314-7b4c2e, and every id of a day shares its date).
+const hexTail = (id) => id.match(/-([0-9a-f]{6})$/)?.[1] ?? '';
+const ID_TIERS = [
+  (full, id) => full.startsWith(id) || full.endsWith(id),
+  (full, id) => hexTail(full).startsWith(id),
+];
+
+const ambiguous = (id, hits) => usage(`id "${id}" is ambiguous: ${hits.slice(0, 5).join(', ')}${hits.length > 5 ? ', ...' : ''}`);
+
+// A short id to show in an example: the end of your newest letter's id.
+function exampleId(box, me) {
+  const mine = box.messages.find((m) => isFor(m, me) && hexTail(m.id)) ?? box.messages.find((m) => hexTail(m.id));
+  return mine ? hexTail(mine.id) : '';
+}
+
 function findLetter(box, rawId, me) {
   const id = checkId(rawId);
   const exact = box.messages.find((m) => m.id === id);
   if (exact) return exact;
-  let hits = box.messages.filter((m) => m.id.endsWith(id) || m.id.startsWith(id));
-  if (hits.length > 1) {
-    const mine = hits.filter((m) => isFor(m, me));
-    if (mine.length > 0) hits = mine;
+  for (const tier of ID_TIERS) {
+    let hits = box.messages.filter((m) => tier(m.id, id));
+    if (hits.length > 1) {
+      const mine = hits.filter((m) => isFor(m, me));
+      if (mine.length > 0) hits = mine;
+    }
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) throw ambiguous(id, hits.map((m) => m.id));
   }
-  if (hits.length === 1) return hits[0];
-  if (hits.length > 1) throw usage(`id "${id}" is ambiguous: ${hits.slice(0, 5).map((m) => m.id).join(', ')}${hits.length > 5 ? ', ...' : ''}`);
-  throw new BellError(`no message with id "${id}" (yogit inbox --all lists your mail)`);
+  const example = exampleId(box, me);
+  const how = example ? `Ids match by their end, e.g. ${example}` : 'Ids match by their start or their end';
+  throw new BellError(`no message with id "${id}". ${how} (yogit inbox --all lists your mail)`);
 }
 
 // A letter, or failing that the tombstone of a deleted one: { letter } or { tomb }.
@@ -783,9 +805,12 @@ function findTarget(box, rawId, me) {
     if (!(err instanceof BellError) || err.code !== 1) throw err;
     const id = checkId(rawId);
     const ids = [...box.tombs.keys()];
-    const hits = ids.includes(id) ? [id] : ids.filter((t) => t.startsWith(id) || t.endsWith(id));
-    if (hits.length === 1) return { tomb: box.tombs.get(hits[0]) };
-    if (hits.length > 1) throw usage(`id "${id}" is ambiguous: ${hits.slice(0, 5).join(', ')}${hits.length > 5 ? ', ...' : ''}`);
+    if (ids.includes(id)) return { tomb: box.tombs.get(id) };
+    for (const tier of ID_TIERS) {
+      const hits = ids.filter((t) => tier(t, id));
+      if (hits.length === 1) return { tomb: box.tombs.get(hits[0]) };
+      if (hits.length > 1) throw ambiguous(id, hits);
+    }
     throw err;
   }
 }
@@ -2058,7 +2083,8 @@ try:  yogit send codex "tests are green"      then, as codex:  yogit ring; yogit
 Who you are: --as, then $YOGIT_AS (or $BELL_AS, its older name, which wins if both
 are set), then \`git config bell.name\` (set it per worktree with \`yogit name\`), then
 the agent you run inside (claude, codex, cursor, gemini, agy), then your git user.name.
-Ids can be shortened to any unique prefix or suffix. Quote message text:
+Ids can be shortened to any unique prefix or suffix, or the start of the 6-hex end
+(yogit read 7b4c). Quote message text:
 --subject, --kind, --sign and --as are read anywhere, and any other option inside
 the text is refused, never silently dropped. Text after -- is always text.
 Receipts: \`git config bell.receipts false\` keeps your delivered and read receipts in

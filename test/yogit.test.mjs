@@ -170,6 +170,27 @@ test('send, inbox, read, ack and reply', () => withSandbox((sb) => {
   assert.match(missing.err, /^yogit: no message with id/);
 }));
 
+test('short ids: the start of the 6-hex end works too, after prefix and suffix, so no old id changes meaning', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const at = (id, secs) => ({ version: 1, id, ts: `2026-01-01T12:00:${secs}.000Z`, from: 'claude', to: 'codex', kind: 'msg', subject: '', body: id });
+  plant(sb, repo, at('20260101-120000-abcdef', '00'));
+  plant(sb, repo, at('20260101-120001-00beef', '01')); // "beef" is its suffix
+  plant(sb, repo, at('20260101-120002-beef01', '02')); // and the start of this one's hex end
+  plant(sb, repo, at('20260101-120003-cafe01', '03'));
+  plant(sb, repo, at('20260101-120004-cafe02', '04'));
+  const resolve = (short) => sb.bell(repo, ['status', short, '--json']);
+  assert.equal(JSON.parse(resolve('abcd').out).id, '20260101-120000-abcdef', 'the start of the hex end');
+  assert.equal(JSON.parse(resolve('beef').out).id, '20260101-120001-00beef', 'a suffix still wins over a hex start');
+  const both = resolve('cafe');
+  assert.equal(both.code, 2);
+  assert.match(both.err, /ambiguous/);
+  assert.equal(JSON.parse(resolve('def').out).id, '20260101-120000-abcdef', 'suffixes resolve as before');
+  const missing = sb.bell(repo, ['read', '7b4c', '--as', 'codex']);
+  assert.equal(missing.code, 1);
+  assert.match(missing.err, /^yogit: no message with id "7b4c"/);
+  assert.match(missing.err, /e\.g\. [0-9a-f]{6}\b/, 'the error shows a real short id to copy');
+}));
+
 test('kind: defaults to "msg", --kind sets it, and it is shown', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   const id = sentId(sb.bell(repo, ['send', 'codex', 'can', 'you', 'look', '--kind', 'ASK', '--as', 'claude']));
