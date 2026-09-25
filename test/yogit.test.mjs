@@ -1287,7 +1287,7 @@ test('package, --version and --help name yogit', () => withSandbox((sb) => {
   assert.equal(help.code, 0);
   assert.match(help.out, /^yogit /);
   assert.match(help.out, /usage: yogit <command>/);
-  for (const cmd of ['send', 'inbox', 'read', 'reply', 'ack', 'archive', 'unarchive', 'delete', 'status', 'outbox', 'ring', 'watch', 'sync', 'who', 'name', 'gc', 'verify', 'import-h5i', 'doctor', 'hooks', 'ring-setup', 'version', 'about']) {
+  for (const cmd of ['init', 'send', 'inbox', 'read', 'reply', 'ack', 'archive', 'unarchive', 'delete', 'status', 'outbox', 'ring', 'watch', 'sync', 'who', 'name', 'gc', 'verify', 'import-h5i', 'doctor', 'hooks', 'ring-setup', 'version', 'about']) {
     assert.match(help.out, new RegExp(`^  ${cmd}\\b`, 'm'));
   }
   assert.equal(sb.bell(sb.dir, ['help']).out, help.out);
@@ -1441,7 +1441,9 @@ test('doctor reports ok, info, warn and fail, each with a fix, and changes nothi
   const stale = doctor(repo);
   assert.equal(stale.code, 1);
   assert.match(stale.out, /^fail .*settings\.local\.json.*\/nonexistent\/node.*-> yogit init claude/m);
-  writeFileSync(join(repo, '.claude', 'settings.local.json'), settings(hookCommand));
+  const refreshed = sb.bell(repo, ['init', 'claude', '--yes'], { env: { PATH: bin } });
+  assert.match(refreshed.out, /update - its hook names a node or yogit\.mjs that is gone/, 'init refreshes a stale hook in place');
+  assert.deepEqual(JSON.parse(readFileSync(join(repo, '.claude', 'settings.local.json'), 'utf8')), JSON.parse(settings(hookCommand)));
   assert.match(doctor(repo).out, /^ok +\.claude\/settings\.local\.json: SessionStart runs yogit ring/m);
 
   // (f) A ring command that is not a JSON argv.
@@ -1462,6 +1464,306 @@ test('doctor reports ok, info, warn and fail, each with a fix, and changes nothi
   doctor(repo, {}, ['--json']);
   doctor(a);
   assert.deepEqual(snapshot(), before);
+}));
+
+// ---------------------------------------------------------------- init
+
+// A repo to set up, with PATH pinned (no stub tools unless named) and a throwaway HOME.
+function initSandbox(sb, { stubs = [], name = 'repo' } = {}) {
+  const bin = pinnedPath(sb, stubs, `bin-${name}`);
+  const repo = sb.repo(name, { commit: true });
+  sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
+  const init = (args, { env = {}, cwd = repo, script } = {}) => sb.bell(cwd, ['init', ...args], { env: { PATH: bin, ...env }, script });
+  const local = join(repo, '.claude', 'settings.local.json');
+  const exclude = join(repo, '.git', 'info', 'exclude');
+  return { bin, repo, init, local, exclude };
+}
+
+const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
+// The group `yogit hooks claude` prints, with only its command swapped: the shape init must write.
+const hookGroup = (sb, command) => {
+  const printed = JSON.parse(sb.bell(sb.dir, ['hooks', 'claude']).out).hooks.SessionStart[0];
+  printed.hooks[0].command = command;
+  return printed;
+};
+const initCommand = (sb, bin) => HOOK_LINE.exec(sb.bell(sb.dir, ['hooks', 'claude'], { env: { PATH: bin } }).err)[1];
+
+test('init: without a terminal and without --yes it only shows the plan, and changes nothing', () => withSandbox((sb) => {
+  const { repo, init, local, bin } = initSandbox(sb);
+  const state = () => [sb.git(repo, 'status', '--porcelain', '--ignored'), sb.git(repo, 'config', '--list', '--show-origin'), tree(sb.dir)];
+  const before = state();
+  const dry = init(['claude', 'cursor', '--name', 'x']);
+  assert.equal(dry.code, 0, dry.err);
+  assert.match(dry.out, /to apply: yogit init claude cursor --name x --yes/);
+  assert.match(dry.out, /settings\.local\.json/);
+  assert.match(dry.out, /info\/exclude/);
+  assert.match(dry.out, /bell\.name/);
+  assert.deepEqual(state(), before, 'working tree, status, config (with --name) and HOME are unchanged');
+  assert.equal(init(['claude', '--dry-run', '--yes']).code, 2, '--dry-run and --yes contradict each other');
+  // Positive control: the same comparison sees what --yes changes.
+  assert.equal(init(['claude', 'cursor', '--name', 'x', '--yes']).code, 0);
+  assert.notDeepEqual(state(), before);
+  assert.deepEqual(readJson(local).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+}));
+
+test('init claude merges one hook into settings.local.json, leaves the rest alone, runs without node on PATH, and undoes exactly', { skip: process.platform === 'win32' && 'POSIX sh only' }, () => withSandbox((sb) => {
+  const { repo, init, local, exclude, bin } = initSandbox(sb);
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  mkdirSync(join(repo, '.claude'));
+  const theirs = {
+    permissions: { allow: ['Bash(npm test)'] },
+    env: { SECRET: 'canary-123' },
+    hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo hello' }] }], Stop: [{ hooks: [{ type: 'command', command: 'true' }] }] },
+  };
+  const original = `${JSON.stringify(theirs, null, 2)}\n`;
+  writeFileSync(local, original);
+  const excludeBefore = readFileSync(exclude, 'utf8');
+
+  // (b) Everything but the new entry is exactly as it was, and no secret is printed.
+  const first = init(['claude', '--yes']);
+  assert.equal(first.code, 0, first.out + first.err);
+  assert.ok(!(first.out + first.err).includes('canary-123'), 'init never prints a settings file');
+  const merged = readJson(local);
+  const command = initCommand(sb, bin);
+  assert.deepEqual(merged.hooks.SessionStart.at(-1), hookGroup(sb, command), 'the shape `yogit hooks claude` prints, command swapped');
+  merged.hooks.SessionStart.pop();
+  assert.deepEqual(merged, theirs);
+  assert.equal(sb.git(repo, 'status', '--porcelain'), '', 'the local settings file is excluded, so status stays clean');
+  assert.match(readFileSync(exclude, 'utf8'), /^# yogit\n\/\.claude\/settings\.local\.json$/m);
+
+  // (c) The written command rings under a PATH with no node on it.
+  const nodeless = onlyOnPath(sb, 'nodeless', ['sh', 'git', 'env']);
+  const ran = spawnSync('/bin/sh', ['-c', command], { cwd: repo, env: { ...sb.baseEnv, PATH: nodeless, CLAUDECODE: '1' }, encoding: 'utf8' });
+  assert.equal(ran.stdout, 'yogit: 1 unread for claude (from codex) - run: yogit inbox\n', ran.stderr);
+
+  // (d) Again: nothing to do, and not a byte changes.
+  const bytes = readFileSync(local, 'utf8');
+  const again = init(['claude', '--yes']);
+  assert.match(again.out, /already set up/);
+  assert.equal(readFileSync(local, 'utf8'), bytes);
+
+  // (e) Undo: the file is byte for byte what it was, and the exclude lines are gone.
+  const undo = init(['claude', '--undo', '--yes']);
+  assert.equal(undo.code, 0, undo.out + undo.err);
+  assert.equal(readFileSync(local, 'utf8'), original);
+  assert.equal(readFileSync(exclude, 'utf8'), excludeBefore);
+
+  // A file init created is removed with its directory, and status is back to what it was.
+  rmSync(join(repo, '.claude'), { recursive: true });
+  const status = sb.git(repo, 'status', '--porcelain');
+  assert.equal(init(['claude', '--yes']).code, 0);
+  assert.deepEqual(readJson(local), { hooks: { SessionStart: [hookGroup(sb, command)] } });
+  assert.equal(init(['claude', '--undo', '--yes']).code, 0);
+  assert.equal(existsSync(join(repo, '.claude')), false);
+  assert.equal(sb.git(repo, 'status', '--porcelain'), status);
+}));
+
+test('init leaves hooks it did not write alone, keeps 4-space and tab files byte for byte, and follows a symlink', () => withSandbox((sb) => {
+  const { repo, init, local, bin } = initSandbox(sb);
+  mkdirSync(join(repo, '.claude'));
+  // (f) A hand-written yogit hook counts as set up: no second entry, no double ring, and undo keeps it.
+  for (const command of ['yogit ring', 'yogit ring --as x']) {
+    const hand = `${JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command }] }] } }, null, 2)}\n`;
+    writeFileSync(local, hand);
+    assert.match(init(['claude', '--yes']).out, /already set up/);
+    assert.equal(readFileSync(local, 'utf8'), hand);
+    const undo = init(['claude', '--undo', '--yes']);
+    assert.match(undo.out, /kept/);
+    assert.ok(undo.out.includes(command));
+    assert.equal(readFileSync(local, 'utf8'), hand, `${command} survives init and undo`);
+  }
+  // Another scope's yogit hook counts too: Claude runs every scope's hooks.
+  rmSync(local);
+  writeFileSync(join(repo, '.claude', 'settings.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'yogit ring' }] }] } }));
+  assert.match(init(['claude', '--yes']).out, /already set up.*settings\.json/);
+  assert.equal(existsSync(local), false);
+  rmSync(join(repo, '.claude', 'settings.json'));
+
+  // The file's own indent and final newline are kept, so undo gives back the same bytes.
+  for (const [indent, newline] of [[4, '\n'], ['\t', '\n'], [2, '']]) {
+    const original = JSON.stringify({ permissions: { allow: ['Read'] }, model: 'x' }, null, indent) + newline;
+    writeFileSync(local, original);
+    assert.equal(init(['claude', '--yes']).code, 0);
+    const written = readFileSync(local, 'utf8');
+    assert.ok(written.includes(`${typeof indent === 'number' ? ' '.repeat(indent) : indent}"hooks"`), written);
+    assert.equal(written.endsWith('\n'), newline === '\n');
+    assert.equal(init(['claude', '--undo', '--yes']).code, 0);
+    assert.equal(readFileSync(local, 'utf8'), original, `indent ${JSON.stringify(indent)}`);
+  }
+  // A layout JSON.stringify would not produce is said up front: its whitespace changes.
+  writeFileSync(local, '{ "model": "x" }\n');
+  assert.match(init(['claude']).out, /whitespace/);
+
+  // (h) A symlinked settings file stays a symlink; its target gets the entry.
+  rmSync(local);
+  mkdirSync(join(sb.dir, 'dotfiles'));
+  const target = join(sb.dir, 'dotfiles', 'claude-local.json');
+  writeFileSync(target, '{}\n');
+  symlinkSync(target, local);
+  assert.equal(init(['claude', '--yes']).code, 0);
+  assert.equal(readlinkSync(local), target);
+  assert.deepEqual(readJson(target).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+}));
+
+test('init refuses a settings file that is not strict JSON, prints the fragment instead, and still does the rest', () => withSandbox((sb) => {
+  const { repo, init, local } = initSandbox(sb);
+  mkdirSync(join(repo, '.claude'));
+  const jsonc = '{\n  // my settings\n  "model": "x"\n}\n';
+  writeFileSync(local, jsonc);
+  const r = init(['claude', 'cursor', '--yes']);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /refused/);
+  assert.match(r.out, /"SessionStart"/, 'the fragment to paste by hand');
+  assert.equal(readFileSync(local, 'utf8'), jsonc, 'not a byte changed');
+  assert.ok(existsSync(join(repo, '.cursor', 'rules', 'yogit.mdc')), 'the cursor rule was still written');
+}));
+
+test('init --user writes only under HOME (or CLAUDE_CONFIG_DIR) and CODEX_HOME, never in the repo', () => withSandbox((sb) => {
+  const { repo, init, bin } = initSandbox(sb);
+  const codexHome = join(sb.dir, 'codex-home');
+  const repoTree = tree(repo);
+  const r = init(['claude', 'codex', '--user', '--yes'], { env: { CODEX_HOME: codexHome } });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(readJson(join(sb.dir, '.claude', 'settings.json')).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+  assert.match(readFileSync(join(codexHome, 'AGENTS.md'), 'utf8'), /^<!-- yogit:begin -->\n## Agent mailbox \(yogit\)[\s\S]*<!-- yogit:end -->\n$/);
+  assert.deepEqual(tree(repo), repoTree, 'the repo is untouched');
+  const elsewhere = join(sb.dir, 'claude-config');
+  assert.equal(init(['claude', '--user', '--yes'], { env: { CLAUDE_CONFIG_DIR: elsewhere } }).code, 0);
+  assert.ok(existsSync(join(elsewhere, 'settings.json')), 'CLAUDE_CONFIG_DIR is where Claude Code reads user settings from');
+  assert.equal(init(['claude', 'codex', '--user', '--undo', '--yes'], { env: { CODEX_HOME: codexHome } }).code, 0);
+  assert.equal(existsSync(join(sb.dir, '.claude', 'settings.json')), false);
+  assert.equal(existsSync(join(codexHome, 'AGENTS.md')), false);
+}));
+
+test('init from npx refuses to write a hook into its disposable cache', () => withSandbox((sb) => {
+  const { repo, init, exclude } = initSandbox(sb);
+  const cached = join(sb.dir, '_npx', 'abc', 'node_modules', '@yoam', 'yogit', 'yogit.mjs');
+  mkdirSync(join(cached, '..'), { recursive: true });
+  writeFileSync(cached, SOURCE);
+  const before = [tree(repo), readFileSync(exclude, 'utf8')];
+  const r = init(['claude', '--yes'], { script: cached });
+  assert.match(r.out, /npm i -g @yoam\/yogit/);
+  assert.deepEqual([tree(repo), readFileSync(exclude, 'utf8')], before, 'nothing written');
+}));
+
+test('init cursor: create-only, kept out of git status, and undo keeps what another worktree still needs', () => withSandbox((sb) => {
+  const { repo, init, exclude } = initSandbox(sb);
+  const rule = join(repo, '.cursor', 'rules', 'yogit.mdc');
+  const printed = sb.bell(sb.dir, ['hooks', 'cursor']).out;
+  const excludeBefore = readFileSync(exclude, 'utf8');
+  assert.equal(init(['cursor', '--yes']).code, 0);
+  assert.equal(readFileSync(rule, 'utf8'), printed, 'the same bytes `yogit hooks cursor` prints');
+  assert.equal(sb.git(repo, 'status', '--porcelain'), '');
+  // (k) A different yogit.mdc is someone's: left alone, and said so.
+  writeFileSync(rule, 'mine\n');
+  assert.match(init(['cursor', '--yes']).out, /left alone/);
+  assert.equal(readFileSync(rule, 'utf8'), 'mine\n');
+  assert.match(init(['cursor', '--undo', '--yes']).out, /kept/);
+  assert.equal(readFileSync(rule, 'utf8'), 'mine\n');
+  rmSync(join(repo, '.cursor'), { recursive: true });
+
+  // info/exclude is shared by every worktree: undo in one keeps the line another still uses.
+  const other = join(sb.dir, 'other');
+  sb.git(repo, 'worktree', 'add', '-q', other);
+  assert.equal(init(['cursor', '--yes']).code, 0);
+  assert.equal(init(['cursor', '--yes'], { cwd: other }).code, 0);
+  assert.equal(init(['cursor', '--undo', '--yes']).code, 0);
+  assert.equal(existsSync(join(repo, '.cursor')), false);
+  assert.match(readFileSync(exclude, 'utf8'), /\/\.cursor\/rules\/yogit\.mdc/, 'kept for the other worktree');
+  assert.equal(sb.git(other, 'status', '--porcelain'), '');
+  assert.equal(init(['cursor', '--undo', '--yes'], { cwd: other }).code, 0);
+  assert.equal(readFileSync(exclude, 'utf8'), excludeBefore, 'gone with the last one');
+}));
+
+test('init codex: AGENTS.md is shared, so it is written only with --project (or --user), and undone byte for byte', () => withSandbox((sb) => {
+  const { repo, init } = initSandbox(sb);
+  const agents = join(repo, 'AGENTS.md');
+  const original = '# Project\n\nsome text\n';
+  writeFileSync(agents, original);
+  const plain = init(['codex', '--yes']);
+  assert.equal(plain.code, 0);
+  assert.match(plain.out, /--project/);
+  assert.equal(readFileSync(agents, 'utf8'), original, 'a tracked, team-shared file is not written by default');
+  assert.equal(init(['codex', '--project', '--yes']).code, 0);
+  const text = readFileSync(agents, 'utf8');
+  assert.ok(text.startsWith(original), 'the block is added after what was there');
+  assert.ok(text.includes(sb.bell(sb.dir, ['hooks', 'codex']).out.trimEnd()));
+  assert.match(init(['codex', '--project', '--yes']).out, /already set up/);
+  assert.equal(init(['codex', '--project', '--undo', '--yes']).code, 0);
+  assert.equal(readFileSync(agents, 'utf8'), original);
+
+  // gemini, agy and aider get advice and no files; aider sets no variable, so it gets a name by hand.
+  const status = sb.git(repo, 'status', '--porcelain', '--ignored');
+  const advice = init(['gemini', 'agy', 'aider', '--yes']);
+  assert.equal(advice.code, 0);
+  assert.match(advice.out, /YOGIT_AS=aider aider/);
+  assert.match(advice.out, /GEMINI_CLI/);
+  assert.match(advice.out, /ANTIGRAVITY_AGENT/);
+  assert.equal(sb.git(repo, 'status', '--porcelain', '--ignored'), status, 'no files');
+}));
+
+test('init: mail sync is a separate, opt-in step, and no refspec is ever written', () => withSandbox((sb) => {
+  const bin = pinnedPath(sb);
+  const { bare, a, b } = hubAndClones(sb);
+  sentId(sb.bell(a, ['send', 'bob', 'waiting for you', '--as', 'alice']));
+  assert.equal(sb.bell(a, ['sync', '--as', 'alice']).code, 0);
+  const init = (args) => sb.bell(b, ['init', 'cursor', ...args], { env: { PATH: bin, BELL_AS: 'bob' } });
+  const fetch = sb.git(b, 'config', '--get-all', 'remote.origin.fetch');
+  const hub = sb.refs(bare);
+  assert.match(init([]).out, /yogit sync/, '(l) the dry run names the next step');
+  assert.equal(init(['--yes']).code, 0);
+  assert.deepEqual(sb.refs(b), [], 'plain --yes stays local: nothing fetched');
+  assert.deepEqual(sb.refs(bare), hub, 'and nothing pushed');
+  const synced = init(['--yes', '--sync']);
+  assert.equal(synced.code, 0, synced.out + synced.err);
+  assert.equal(inboxJson(sb, b, 'bob').messages[0].body, 'waiting for you');
+  assert.equal(sb.git(b, 'config', '--get-all', 'remote.origin.fetch'), fetch, 'no refs/bell refspec');
+}));
+
+test('init finds the tools on PATH, and naming tools replaces that', () => withSandbox((sb) => {
+  const none = initSandbox(sb, { name: 'none' });
+  const bare = none.init([]);
+  assert.equal(bare.code, 0);
+  const toolLines = (out) => out.split('\n').filter((l) => /^  (claude|codex|cursor|gemini|agy|aider) /.test(l)).map((l) => l.trim().split(' ')[0]);
+  assert.match(bare.out, /no agent tools found/, 'negative control: nothing on PATH, nothing detected');
+  assert.deepEqual(toolLines(bare.out), []);
+  const found = initSandbox(sb, { name: 'found', stubs: ['claude', 'codex'] });
+  const plan = found.init([]).out;
+  assert.deepEqual([...new Set(toolLines(plan))], ['claude', 'codex'], plan);
+  assert.match(plan, /settings\.local\.json/);
+  const named = found.init(['cursor']).out;
+  assert.deepEqual([...new Set(toolLines(named))], ['cursor'], named);
+  assert.equal(found.init(['vim']).code, 2);
+  // (n) Outside a repo there is nothing to set up yet.
+  const outside = join(sb.dir, 'outside');
+  mkdirSync(outside);
+  const out = sb.bell(outside, ['init'], { env: { PATH: found.bin } });
+  assert.equal(out.code, 1);
+  assert.match(out.out + out.err, /git init/);
+}));
+
+const SCRIPT = process.platform === 'linux' ? spawnSync('sh', ['-c', 'command -v script'], { encoding: 'utf8' }).stdout.trim() : '';
+const hasScript = SCRIPT.startsWith('/') && !spawnSync(SCRIPT, ['--version'], { stdio: 'ignore' }).error;
+
+test('init at a terminal asks before it writes', { skip: !hasScript && 'util-linux script not found' }, () => withSandbox((sb) => {
+  const { repo, bin } = initSandbox(sb);
+  const rule = join(repo, '.cursor', 'rules', 'yogit.mdc');
+  const atTerminal = (answer) => spawnSync(SCRIPT, ['-qec', `${process.execPath} ${YOGIT} init cursor`, '/dev/null'], {
+    cwd: repo, env: { ...sb.baseEnv, PATH: bin }, encoding: 'utf8', input: answer, timeout: 20000,
+  });
+  const no = atTerminal('n\n');
+  assert.match(no.stdout, /\[y\/N\]/, no.stdout + no.stderr);
+  assert.equal(existsSync(rule), false, 'no is no');
+  const yes = atTerminal('y\n');
+  assert.match(yes.stdout, /\[y\/N\]/);
+  assert.ok(existsSync(rule), yes.stdout + yes.stderr);
+}));
+
+test('init on Windows prints the Claude hook instead of writing it', { skip: process.platform !== 'win32' && 'Windows only' }, () => withSandbox((sb) => {
+  const repo = sb.repo('repo', { commit: true });
+  const r = sb.bell(repo, ['init', 'claude', '--yes'], { env: { BELL_AS: 'x' } });
+  assert.match(r.out, /"SessionStart"/);
+  assert.equal(existsSync(join(repo, '.claude', 'settings.local.json')), false);
 }));
 
 test('"git yogit" works as a git subcommand when git-yogit is on PATH', () => withSandbox((sb) => {
