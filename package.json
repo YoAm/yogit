@@ -28,5 +28,13 @@
     "git-bell",
     "i5h"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YoAm/git-bell.git"
+  },
+  "homepage": "https://github.com/YoAm/git-bell#readme",
+  "bugs": {
+    "url": "https://github.com/YoAm/git-bell/issues"
+  }
 }
