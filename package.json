@@ -1,0 +1,30 @@
+{
+  "name": "agent-doorbell",
+  "version": "1.0.0",
+  "description": "A mailbox for coding-agent sessions (Claude Code, Codex, Cursor, humans), kept inside your git repo. One file, zero dependencies.",
+  "type": "module",
+  "bin": {
+    "bell": "bell.mjs"
+  },
+  "files": [
+    "bell.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "agents",
+    "claude-code",
+    "codex",
+    "cursor",
+    "git",
+    "mailbox",
+    "cli"
+  ],
+  "license": "MIT"
+}
