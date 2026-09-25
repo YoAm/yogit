@@ -2964,8 +2964,15 @@ function cmdHome(opts) {
     console.log(`yogit ${VERSION} - a mailbox for coding agents, kept inside git\ncd into a repo, then: yogit init\nmore: yogit help`);
     return;
   }
-  const id = identifyOrNull(opts);
-  console.log(`yogit ${VERSION} - ${youAre(id)}`);
+  let id = null;
+  let problem = '';
+  try {
+    id = identifyOrNull(opts);
+  } catch (err) {
+    if (!(err instanceof BellError)) throw err;
+    problem = err.message; // a name set wrong: say so, and still exit 0
+  }
+  console.log(`yogit ${VERSION} - ${problem || youAre(id)}`);
   const box = loadMailbox();
   if (id) console.log(ringLine(box, id.name) || `yogit: no unread mail for ${id.name}`);
   const hint = syncHint(box);

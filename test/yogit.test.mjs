@@ -1305,6 +1305,9 @@ test('bare yogit says who you are and what is waiting, and mistakes get the comm
   const nameless = sb.bell(repo, []);
   assert.equal(nameless.code, 0, 'bare yogit always exits 0');
   assert.match(nameless.out, /yogit name <name>/);
+  const misnamed = sb.bell(repo, [], { env: { BELL_AS: '../x' } });
+  assert.equal(misnamed.code, 0, 'even with a name set wrong');
+  assert.match(misnamed.out, /invalid BELL_AS name[\s\S]*yogit doctor/);
   const id = sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
   const events = () => sb.refs(repo, 'refs/bell/event');
   const before = events();
