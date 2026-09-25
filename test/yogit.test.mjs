@@ -1150,6 +1150,70 @@ test('hooks print snippets and never write files', () => withSandbox((sb) => {
   assert.match(cursor.err, /\.cursor\/rules\/yogit\.mdc/);
   assert.equal(sb.bell(empty, ['hooks', 'vim']).code, 2);
   assert.deepEqual(readdirSync(empty), [], 'no files written');
+
+  // What agents read must not tell them their name, or re-teach the shared bell.name.
+  for (const agent of ['claude', 'codex', 'cursor']) {
+    const h = sb.bell(empty, ['hooks', agent]);
+    for (const bad of ['git config bell.name', 'BELL_AS', 'Your name is', 'command -v yogit']) {
+      assert.ok(!(h.out + h.err).includes(bad), `hooks ${agent} says ${JSON.stringify(bad)}`);
+    }
+  }
+  assert.match(sb.bell(empty, ['hooks', 'codex']).out, /yogit who/);
+}));
+
+// A directory holding only the named programs (as symlinks), for a PATH with nothing else on it.
+function onlyOnPath(sb, name, programs) {
+  const bin = join(sb.dir, name);
+  mkdirSync(bin);
+  for (const program of programs) {
+    const found = spawnSync('sh', ['-c', `command -v ${program}`], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(found.startsWith('/'), `${program} on the test host's PATH`);
+    symlinkSync(found, join(bin, program));
+  }
+  return bin;
+}
+const HOOK_LINE = /^#   (if test -x .+ fi)$/m;
+
+test('the hook command yogit suggests names node and yogit by path, and fails soft when either is gone', { skip: process.platform === 'win32' && 'POSIX sh only' }, () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const bare = onlyOnPath(sb, 'bare', ['sh', 'git', 'env']); // no node: the nvm or GUI-app case
+  const sh = (command, env = {}) => spawnSync('/bin/sh', ['-c', command], { cwd: repo, env: { ...sb.baseEnv, PATH: bare, CLAUDECODE: '1', ...env }, encoding: 'utf8' });
+  const RING = 'yogit: 1 unread for claude (from codex) - run: yogit inbox\n';
+
+  // Positive control: this PATH really lacks node, so yogit's own #!/usr/bin/env node line fails.
+  assert.equal(sh(YOGIT + ' ring').status, 127, 'a bare path to yogit.mjs cannot run without node on PATH');
+
+  const hooks = sb.bell(repo, ['hooks', 'claude']);
+  assert.equal(JSON.parse(hooks.out).hooks.SessionStart[0].hooks[0].command, 'yogit ring', 'stdout stays the portable snippet');
+  assert.match(hooks.err, /yogit init claude/);
+  const command = HOOK_LINE.exec(hooks.err)?.[1];
+  assert.ok(command, `a runnable command on stderr: ${hooks.err}`);
+  const ran = sh(command);
+  assert.equal(ran.status, 0, ran.stderr);
+  assert.equal(ran.stdout, RING);
+
+  // Paths with a space and a quote survive the quoting.
+  const odd = join(sb.dir, "it's a dir");
+  mkdirSync(odd);
+  writeFileSync(join(odd, 'yogit.mjs'), SOURCE);
+  const oddCommand = HOOK_LINE.exec(sb.bell(repo, ['hooks', 'claude'], { script: join(odd, 'yogit.mjs') }).err)?.[1];
+  assert.ok(oddCommand.includes("it'\\''s a dir"), oddCommand);
+  assert.equal(sh(oddCommand).stdout, RING);
+
+  // The node on PATH is named when it is this very node (a Homebrew or distro symlink survives
+  // upgrades that delete the versioned path it points at); gone, the hook exits 0 with a hint.
+  const linked = join(sb.dir, 'linked');
+  mkdirSync(linked);
+  symlinkSync(process.execPath, join(linked, 'node'));
+  const viaLink = HOOK_LINE.exec(sb.bell(repo, ['hooks', 'claude'], { env: { PATH: `${linked}:${process.env.PATH}` } }).err)?.[1];
+  assert.ok(viaLink.includes(join(linked, 'node')), viaLink);
+  assert.equal(sh(viaLink).stdout, RING);
+  rmSync(join(linked, 'node'));
+  const stale = sh(viaLink);
+  assert.equal(stale.status, 0, 'a stale hook must not show an error at every session start');
+  assert.equal(stale.stdout, '');
+  assert.match(stale.stderr, /yogit init/);
 }));
 
 test('package, --version and --help name yogit', () => withSandbox((sb) => {
