@@ -2872,7 +2872,7 @@ function cmdDoctor(opts) {
       else report('ok', `${where}: SessionStart runs yogit ring${paths ? ' (node and yogit by path)' : command === 'yogit ring' ? '' : ` (${command})`}`);
     }
   }
-  if (claudeHooks.length > 1) report('warn', `Claude Code runs the hooks of every scope, so it rings ${claudeHooks.length} times: ${claudeHooks.join(', ')}`, 'keep one: yogit init claude --undo, or yogit init claude --user --undo');
+  if (claudeHooks.length > 1) report('warn', `Claude Code runs the hooks of every scope, so it rings ${claudeHooks.length} times: ${claudeHooks.join(', ')}`, 'keep one: yogit init claude --undo (or --user --undo) removes a hook init wrote; take out a hand-written one by hand');
   for (const path of [top && join(top, 'AGENTS.md'), join(codexDir(), 'AGENTS.md')].filter(Boolean)) {
     let text = '';
     try {

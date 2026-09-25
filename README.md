@@ -177,7 +177,7 @@ Two Claude sessions in two worktrees both detect `claude` by default. To tell th
 yogit name claude-parser
 ```
 
-That name is kept in this worktree's own git config (`yogit name` turns on `extensions.worktreeConfig` for it), so it never reaches the repo's shared config and the other worktrees. It applies to everyone who runs yogit in this worktree, agents included. `yogit name` alone shows your name and where it comes from, and `yogit name --unset` removes it. One catch: `git worktree add` copies the per-worktree config of the worktree you run it from, so a worktree you add from a named one starts with the same name. Run `yogit name --unset` (or `yogit name <other>`) there; `yogit doctor` spots the copy.
+That name is kept in this worktree's own git config (`yogit name` turns on `extensions.worktreeConfig` for it), so it never reaches the repo's shared config and the other worktrees. It applies to everyone who runs yogit in this worktree, agents included. `yogit name` alone shows your name and where it comes from, and `yogit name --unset` removes it. One catch: with `extensions.worktreeConfig` on, recent git (checked with 2.53) makes `git worktree add` copy the per-worktree config of the worktree you run it from, so a worktree you add from a named one starts with the same name. Run `yogit name --unset` (or `yogit name <other>`) there; `yogit doctor` spots the copy.
 
 ## Ring a live session (optional)
 
