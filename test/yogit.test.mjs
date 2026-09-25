@@ -1218,9 +1218,12 @@ test('the hook command yogit suggests names node and yogit by path, and fails so
 
 test('package, --version and --help name yogit', () => withSandbox((sb) => {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.name, 'yogit');
+  assert.equal(pkg.name, '@yoam/yogit', 'npm refused the unscoped name; the commands stay yogit and git yogit');
+  assert.equal(pkg.publishConfig?.access, 'public', 'a scoped package publishes as restricted unless told otherwise');
   assert.deepEqual(pkg.bin, { yogit: 'yogit.mjs', 'git-yogit': 'yogit.mjs' }, 'yogit, and git-yogit so that git yogit works too; no plain "bell" bin: that name is taken');
-  assert.equal(sb.bell(sb.dir, ['--version']).out.trim(), `yogit ${pkg.version}`);
+  assert.ok(pkg.files.includes('yogit.mjs'));
+  assert.equal(sb.bell(sb.dir, ['--version']).out.trim(), `yogit ${pkg.version}`, 'package.json and VERSION move together');
+  assert.ok(!readFileSync(join(ROOT, 'README.md'), 'utf8').includes('2.2 will stop'), 'the 2.0 read mark outlives 2.2: a later release retires it');
   assert.ok(pkg.engines.node);
   assert.ok(SOURCE.startsWith('#!/usr/bin/env node\n'));
   const help = sb.bell(sb.dir, ['--help']);

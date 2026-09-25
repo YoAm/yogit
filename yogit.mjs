@@ -21,7 +21,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 // `yogit about` prints this, and the README closes with it.
 const DEDICATION = "Made by Yonti as a birthday gift for Yogi. Happy birthday, Yogi.";
