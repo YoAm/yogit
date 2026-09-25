@@ -1128,6 +1128,17 @@ async function cmdSend(opts, [to, ...words]) {
   await ring(msg);
 }
 
+// A fresh clone has no mail refs at all, and a plain git fetch brings none,
+// so an empty inbox there says where the mail is. Nothing is stored: the
+// sentence stays true whether or not a sync already found nothing.
+function syncHint(box) {
+  if (box.refs.size > 0) return '';
+  const remotes = git(['remote']).split('\n').filter(Boolean);
+  if (remotes.length === 0) return '';
+  const remote = remotes.includes('origin') ? 'origin' : remotes[0];
+  return `(no mail in this clone yet; mail on ${remote} arrives with: yogit sync${remote === 'origin' ? '' : ` ${remote}`})`;
+}
+
 function cmdInbox(opts) {
   requireRepo();
   const me = whoAmI(opts);
@@ -1146,6 +1157,8 @@ function cmdInbox(opts) {
   if (mail.length === 0) {
     console.log(`yogit: no ${opts.archived ? 'archived ' : opts.all ? '' : 'unread '}mail for ${me}`);
     if (aside) console.log(aside);
+    const hint = syncHint(box);
+    if (hint) console.log(dim(`  ${hint}`));
     return;
   }
   const unread = mail.filter((m) => isUnread(box, m, me)).length;
@@ -1476,7 +1489,8 @@ function cmdWatch(opts) {
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
   process.stdout.on('error', (err) => process.exit(err.code === 'EPIPE' ? 0 : 1));
-  warn(`watching mail for ${me} every ${seconds}s (Ctrl-C to stop)`);
+  const waiting = myMail(first, me).length;
+  warn(`watching mail for ${me} every ${seconds}s (${waiting ? `${waiting} unread already - yogit inbox; ` : ''}Ctrl-C to stop)`);
   tryMarkDelivered(first, me);
   // Warn about malformed mail once, and again only when the count changes.
   let malformed = malformedFor(first, me);
@@ -1654,6 +1668,8 @@ function cmdWho(opts) {
   }
   const me = id?.name ?? '';
   if (stats.size === 0) console.log('yogit: no mail yet');
+  const hint = syncHint(box);
+  if (hint) console.log(dim(`  ${hint}`));
   const names = [...stats.keys()].sort();
   const width = Math.max(0, ...names.map((n) => n.length));
   for (const name of names) {

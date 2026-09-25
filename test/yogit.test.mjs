@@ -564,6 +564,24 @@ test('sync between two clones through a bare remote', () => withSandbox((sb) => 
   assert.match(broken.err, /does not appear to be a git repository/);
 }));
 
+test('a fresh clone says its mail arrives with yogit sync, until it does', () => withSandbox((sb) => {
+  const { bare, a, b } = hubAndClones(sb);
+  sentId(sb.bell(a, ['send', 'bob', 'hello', '--as', 'alice']));
+  assert.equal(sb.bell(a, ['sync', '--as', 'alice']).code, 0);
+  sb.git(sb.dir, 'clone', '-q', bare, 'c');
+  const c = join(sb.dir, 'c');
+  const HINT = /no mail in this clone yet; mail on origin arrives with: yogit sync/;
+  assert.match(sb.bell(b, ['inbox', '--as', 'bob']).out, HINT);
+  assert.match(sb.bell(b, ['who', '--as', 'bob']).out, HINT);
+  assert.deepEqual(sb.bell(c, ['ring', '--as', 'bob']), { code: 0, out: '', err: '' }, 'ring stays silent: it is for hooks');
+  const json = sb.bell(b, ['inbox', '--json', '--as', 'bob']).out;
+  assert.equal(sb.bell(b, ['sync', '--as', 'bob']).code, 0);
+  assert.doesNotMatch(sb.bell(b, ['inbox', '--as', 'bob', '--all']).out, /yogit sync/, 'gone once mail is here');
+  const lonely = sb.repo('lonely');
+  assert.doesNotMatch(sb.bell(lonely, ['inbox', '--as', 'bob']).out, /yogit sync/, 'no remote, no hint');
+  assert.equal(sb.bell(lonely, ['inbox', '--json', '--as', 'bob']).out, json, 'inbox --json is the same with and without a remote');
+}));
+
 test('sync never deletes unsynced mail, even when fetch prunes', () => withSandbox((sb) => {
   const { bare, a, b } = hubAndClones(sb);
   sb.git(a, 'config', 'fetch.prune', 'true');
@@ -1150,6 +1168,7 @@ test('watch prints one framed line per new message', async () => {
       }
     };
     await until(() => /watching mail for codex/.test(err), 'watch to start');
+    assert.match(err, /watching mail for codex every 0\.2s \(1 unread already - yogit inbox/, 'it says what is already waiting');
     sentId(sb.bell(repo, ['send', 'someone-else', 'not for codex', '--as', 'claude']));
     const id = sentId(sb.bell(repo, ['send', 'codex', 'fresh', '--subject', 'ping', '--as', 'claude']));
     await until(() => out.includes(id), 'the new message');
