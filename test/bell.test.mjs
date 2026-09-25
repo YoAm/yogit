@@ -136,7 +136,7 @@ test('send, inbox, read, ack and reply', () => withSandbox((sb) => {
   assert.match(read.out, new RegExp(`message from claude ${FRAME_TAIL.replace(/[()]/g, '\\$&')}`));
   assert.match(read.out, /tests are green/);
   assert.match(read.out, new RegExp(`reply: git bell reply ${id} "\\.\\.\\."`));
-  assert.equal(sb.git(repo, 'rev-parse', `refs/bell/ack/codex/${id}`), oid, 'ack points at the message');
+  assert.ok(!sb.refs(repo).includes(`refs/bell/ack/codex/${id}`), 'a read writes no 2.0 read mark: 2.1 reads a mark as acked');
   assert.match(sb.bell(repo, ['inbox', '--as', 'codex']).out, /^git-bell: no unread mail for codex/);
   assert.equal(inboxJson(sb, repo, 'codex', ['--all']).messages[0].unread, false);
 
@@ -163,6 +163,7 @@ test('send, inbox, read, ack and reply', () => withSandbox((sb) => {
   assert.equal(inboxJson(sb, repo, 'codex').messages.length, 0);
   const third = sentId(sb.bell(repo, ['send', 'codex', 'third', '--as', 'claude']));
   assert.equal(sb.bell(repo, ['ack', third, '--as', 'codex']).code, 0);
+  assert.equal(sb.git(repo, 'rev-parse', `refs/bell/ack/codex/${third}`), sb.git(repo, 'rev-parse', `refs/bell/inbox/codex/${third}`), 'ack writes the 2.0 mark, pointing at the message');
   assert.equal(inboxJson(sb, repo, 'codex').messages.length, 0);
   const missing = sb.bell(repo, ['read', 'nope123', '--as', 'codex']);
   assert.equal(missing.code, 1);
@@ -388,10 +389,10 @@ test('sync between two clones through a bare remote', () => withSandbox((sb) => 
   assert.match(pullB.out, /received 1 message, 0 read marks, 0 events; sent 0 messages, 0 read marks, 1 event/, 'bob\'s delivered receipt goes back at once');
   assert.match(pullB.out, /1 unread for bob \(from alice\)/);
   sb.bell(b, ['reply', id, 'see you there', '--as', 'bob']);
-  assert.match(sb.bell(b, ['sync', '--as', 'bob']).out, /sent 1 message, 1 read mark, 1 event/, 'the reply, the 2.0 read mark and the read event');
+  assert.match(sb.bell(b, ['sync', '--as', 'bob']).out, /sent 1 message, 0 read marks, 1 event/, 'the reply and the read event (a read writes no 2.0 mark)');
 
   const pullA = sb.bell(a, ['sync', '--as', 'alice']);
-  assert.match(pullA.out, /received 1 message, 1 read mark, 2 events; sent 0 messages, 0 read marks, 1 event/);
+  assert.match(pullA.out, /received 1 message, 0 read marks, 2 events; sent 0 messages, 0 read marks, 1 event/);
   const reply = inboxJson(sb, a, 'alice').messages[0];
   assert.equal(reply.body, 'see you there');
   assert.equal(reply.reply_to, id);
@@ -430,8 +431,8 @@ test('sync never deletes unsynced mail, even when fetch prunes', () => withSandb
   assert.deepEqual(mail(bare), both, 'and delivers it');
   assert.deepEqual(sb.refs(a), sb.refs(bare), 'events too');
 
-  // A read mark that exists only in a survives the next pruning sync too.
-  sb.bell(a, ['read', fromB, '--as', 'claude']);
+  // A read mark (2.1 writes one beside an ack) that exists only in a survives the next pruning sync too.
+  sb.bell(a, ['ack', fromB, '--as', 'claude']);
   const again = sentId(sb.bell(b, ['send', 'claude', 'again', '--as', 'codex']));
   assert.match(sync(b, 'codex'), /received 1 message, 0 read marks, 1 event; sent 1 message, 0 read marks, 1 event/);
   assert.match(sync(a, 'claude'), /received 1 message, 0 read marks, 1 event; sent 0 messages, 1 read mark, 2 events/);
@@ -817,6 +818,9 @@ test('import-h5i counts an id that two different messages share as conflicting, 
   assert.equal(inboxJson(sb, repo, 'codex').messages[0].body, 'first message', 'the letter already here is untouched');
 }));
 
+// One tombstone ref per deletion, under refs/bell/tomb/<to>/<id>/<tomb-id>: tests compare the <to>/<id> part.
+const shaped = (refs) => refs.map((r) => (r.startsWith('refs/bell/tomb/') ? r.replace(/\/[^/]+$/, '/*') : r));
+
 test('gc deletes only mail its owner acked that is older than N days, never unread mail, then packs refs', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   const old = '2020-01-01T00:00:00.000Z';
@@ -835,34 +839,34 @@ test('gc deletes only mail its owner acked that is older than N days, never unre
   const before = sb.refs(repo);
   assert.equal(before.length, 13, 'eleven planted refs, and the recent letter with its acked event and 2.0 read mark');
 
-  const dry = sb.bell(repo, ['gc', '--dry-run']);
+  const dry = sb.bell(repo, ['gc', '--dry-run', '--as', 'codex']);
   assert.equal(dry.code, 0, dry.err);
-  assert.equal(dry.out, 'git-bell: gc would delete 2 messages, 3 read marks and 0 events older than 30d, leaving 2 tombstones; kept 2 unread, 1 read but newer, 1 broadcast (dry run: nothing changed)\n');
+  assert.equal(dry.out, 'git-bell: gc would delete 2 messages, folding 0 events and 3 read marks into tombstones; kept 2 unread, 1 read but newer than 30d, 0 archived, 1 broadcast (dry run: nothing changed)\n');
   assert.deepEqual(sb.refs(repo), before, 'a dry run deletes nothing');
   assert.equal(existsSync(join(repo, '.git', 'packed-refs')), false, 'and packs nothing');
 
-  const run = sb.bell(repo, ['gc', '--older-than', '30d']);
+  const run = sb.bell(repo, ['gc', '--older-than', '30d', '--as', 'codex']);
   assert.equal(run.code, 0, run.err);
-  assert.equal(run.out, 'git-bell: gc deleted 2 messages, 3 read marks and 0 events older than 30d, leaving 2 tombstones; kept 2 unread, 1 read but newer, 1 broadcast; packed refs\n');
+  assert.equal(run.out, 'git-bell: gc deleted 2 messages, folding 0 events and 3 read marks into tombstones; kept 2 unread, 1 read but newer than 30d, 0 archived, 1 broadcast; packed refs\n');
   assert.ok(!run.out.includes('SECRET-GC') && !run.out.includes(acked.id), 'counts only');
   const gone = [
     `refs/bell/inbox/codex/${acked.id}`, `refs/bell/ack/codex/${acked.id}`, `refs/bell/ack/mallory/${acked.id}`,
     `refs/bell/inbox/claude/${ackedV1.id}`, `refs/bell/ack/claude/${ackedV1.id}`,
   ];
-  const tombs = [`refs/bell/tomb/claude/${ackedV1.id}`, `refs/bell/tomb/codex/${acked.id}`];
-  assert.deepEqual(sb.refs(repo), [...before.filter((r) => !gone.includes(r)), ...tombs].sort());
+  const tombs = [`refs/bell/tomb/claude/${ackedV1.id}/*`, `refs/bell/tomb/codex/${acked.id}/*`];
+  assert.deepEqual(shaped(sb.refs(repo)), [...before.filter((r) => !gone.includes(r)), ...tombs].sort());
   const packed = readFileSync(join(repo, '.git', 'packed-refs'), 'utf8');
   assert.match(packed, new RegExp(`refs/bell/inbox/codex/${unread.id}`), 'refs were packed');
   assert.equal(inboxJson(sb, repo, 'codex').messages.length, 3, 'unread mail is all still there (two letters and the broadcast)');
 
   // Even "older than 0 days" never touches unread mail or broadcasts.
-  const all = sb.bell(repo, ['gc', '--older-than', '0d']);
+  const all = sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']);
   assert.equal(all.code, 0, all.err);
-  assert.match(all.out, /^git-bell: gc deleted 1 message, 1 read mark and 1 event older than 0d, leaving 1 tombstone; kept 2 unread, 0 read but newer, 1 broadcast; packed refs\n$/);
-  assert.deepEqual(sb.refs(repo).filter((r) => !r.startsWith('refs/bell/event/')), [
+  assert.match(all.out, /^git-bell: gc deleted 1 message, folding 1 event and 1 read mark into tombstones; kept 2 unread, 0 read but newer than 0d, 0 archived, 1 broadcast; packed refs\n$/);
+  assert.deepEqual(shaped(sb.refs(repo)).filter((r) => !r.startsWith('refs/bell/event/')), [
     `refs/bell/ack/bob/${broadcast.id}`, `refs/bell/ack/mallory/${readByOther.id}`,
     `refs/bell/inbox/all/${broadcast.id}`, `refs/bell/inbox/codex/${unread.id}`, `refs/bell/inbox/codex/${readByOther.id}`,
-    ...tombs, `refs/bell/tomb/codex/${recent}`,
+    ...tombs, `refs/bell/tomb/codex/${recent}/*`,
   ]);
   assert.equal(sb.refs(repo, 'refs/bell/event').length, 3, 'only the delivered events of the three letters kept (the inbox above recorded them)');
 
@@ -883,10 +887,10 @@ test('gc trusts an owner ack only if it points at the letter, and deletes every 
   plant(sb, repo, read, { acks: ['codex'] });
   sb.git(repo, 'update-ref', `refs/bell/ack/mallory/${read.id}`, head);
 
-  const r = sb.bell(repo, ['gc', '--older-than', '0d']);
+  const r = sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']);
   assert.equal(r.code, 0, r.err);
-  assert.equal(r.out, 'git-bell: gc deleted 1 message, 2 read marks and 0 events older than 0d, leaving 1 tombstone; kept 1 unread, 0 read but newer, 0 broadcasts; packed refs\n');
-  assert.deepEqual(sb.refs(repo), [`refs/bell/ack/codex/${neverSeen.id}`, `refs/bell/inbox/codex/${neverSeen.id}`, `refs/bell/tomb/codex/${read.id}`], 'the unseen letter stays, and nothing of the deleted one is left but its tombstone');
+  assert.equal(r.out, 'git-bell: gc deleted 1 message, folding 0 events and 2 read marks into tombstones; kept 1 unread, 0 read but newer than 0d, 0 archived, 0 broadcasts; packed refs\n');
+  assert.deepEqual(shaped(sb.refs(repo)), [`refs/bell/ack/codex/${neverSeen.id}`, `refs/bell/inbox/codex/${neverSeen.id}`, `refs/bell/tomb/codex/${read.id}/*`], 'the unseen letter stays, and nothing of the deleted one is left but its tombstone');
 }));
 
 test('gc in a clone with a remote says its tombstones keep deleted letters from coming back, and that the remote keeps them', () => withSandbox((sb) => {
@@ -894,13 +898,13 @@ test('gc in a clone with a remote says its tombstones keep deleted letters from 
   const id = sentId(sb.bell(a, ['send', 'codex', 'please review X', '--as', 'claude']));
   assert.equal(sb.bell(a, ['sync', '--as', 'claude']).code, 0);
   sb.bell(a, ['read', id, '--as', 'codex']);
-  const r = sb.bell(a, ['gc', '--older-than', '0d']);
+  const r = sb.bell(a, ['gc', '--older-than', '0d', '--as', 'codex']);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /^git-bell: gc deleted 1 message, 1 read mark and 1 event/);
+  assert.match(r.out, /^git-bell: gc deleted 1 message, folding 1 event and 0 read marks into tombstones/);
   assert.match(r.err, /gc left a tombstone for each letter it deleted/);
   assert.match(r.err, /the remote keeps its copies/);
   const lonely = sb.repo('lonely');
-  assert.equal(sb.bell(lonely, ['gc']).err, '', 'no remote, no note');
+  assert.equal(sb.bell(lonely, ['gc', '--as', 'codex']).err, '', 'no remote, no note');
 }));
 
 test('verify reports an unsigned letter, and send --sign fails cleanly with no key', () => withSandbox((sb) => {
@@ -918,6 +922,9 @@ test('verify reports an unsigned letter, and send --sign fails cleanly with no k
   assert.equal(noKey.code, 1, `--sign after the text is a flag, and a missing key is a git error: ${noKey.err}`);
   assert.match(noKey.err, /^git-bell: .*sign/m);
   assert.deepEqual(sb.refs(repo), before, 'nothing delivered when signing fails');
+  const noReply = sb.bell(repo, ['reply', id, 'signed answer', '--sign', '--as', 'codex']);
+  assert.equal(noReply.code, 1, noReply.err);
+  assert.deepEqual(sb.refs(repo), before, 'a reply that cannot be signed marks nothing read either');
   assert.equal(sb.bell(repo, ['verify']).code, 2);
   assert.equal(sb.bell(repo, ['verify', 'nope123']).code, 1);
 }));
@@ -1178,7 +1185,7 @@ test('lifecycle: each state change is an event, and status folds them in time or
 
   const text = sb.bell(repo, ['status', id]);
   assert.equal(text.code, 0, text.err);
-  assert.match(text.out, new RegExp(`^git-bell: ${id} from claude to codex: acked\\n  sent ${T} → notified ${T} → delivered ${T} \\(codex\\) → read ${T} → replied ${T} → acked ${T} → archived ${T} → unarchived ${T} UTC\\n$`));
+  assert.match(text.out, new RegExp(`^git-bell: ${id} from claude to codex: acked\\n  sent ${T} UTC → notified ${T} → delivered ${T} \\(codex\\) → read ${T} → replied ${T} → acked ${T} → archived ${T} \\(codex\\) → unarchived ${T} \\(codex\\)\\n$`));
   assert.match(sb.bell(repo, ['status', id.slice(-6)]).out, new RegExp(`^git-bell: ${id} `), 'short ids work too');
 
   // A ring that fails is recorded the same way.
@@ -1299,7 +1306,7 @@ test('lifecycle: a tombstone keeps gc\'d mail from coming back through sync or i
   assert.equal(sb.bell(a, ['sync', '--as', 'claude']).code, 0);
   assert.equal(sb.bell(b, ['sync', '--as', 'codex']).code, 0, 'b has the letter too');
   assert.equal(sb.bell(a, ['read', id, '--as', 'codex']).code, 0, 'read in a, not synced');
-  const gc = sb.bell(a, ['gc', '--older-than', '0d']);
+  const gc = sb.bell(a, ['gc', '--older-than', '0d', '--as', 'codex']);
   assert.equal(gc.code, 0, gc.err);
   assert.match(gc.out, /^git-bell: gc deleted 1 message/);
 
@@ -1307,9 +1314,11 @@ test('lifecycle: a tombstone keeps gc\'d mail from coming back through sync or i
   assert.deepEqual(inboxJson(sb, a, 'codex', ['--all']).messages, [], 'v2 brought the letter back here, unread');
   assert.match(gc.err, /tombstone/, 'and gc no longer warns that sync brings letters back');
   assert.equal(sb.bell(a, ['ring', '--as', 'codex']).out, '');
-  assert.deepEqual(refsOf(sb, a, id), [`refs/bell/tomb/codex/${id}`], 'only the tombstone, even after sync');
+  const events = (repo) => refsOf(sb, repo, id).filter((r) => r.startsWith('refs/bell/event/'));
+  assert.deepEqual(events(a).map((r) => r.split('/')[5].split('-')[2]), ['delivered'], 'b\'s delivered receipt, which a\'s gc never saw, still arrives');
+  assert.deepEqual(shaped(refsOf(sb, a, id)).filter((r) => !events(a).includes(r)), [`refs/bell/tomb/codex/${id}/*`], 'but never the letter, even after sync');
   assert.equal(recipient(statusJson(sb, a, id), 'codex').state, 'deleted');
-  assert.ok(sb.refs(bare).includes(`refs/bell/tomb/codex/${id}`), 'sync shares the tombstone');
+  assert.ok(shaped(sb.refs(bare)).includes(`refs/bell/tomb/codex/${id}/*`), 'sync shares the tombstone');
 
   // b already had the letter: the tombstone hides it there, and b never sends it back.
   assert.equal(sb.bell(b, ['sync', '--as', 'codex']).code, 0);
@@ -1318,7 +1327,14 @@ test('lifecycle: a tombstone keeps gc\'d mail from coming back through sync or i
   sb.git(sb.dir, 'clone', '-q', bare, 'c');
   const c = join(sb.dir, 'c');
   assert.equal(sb.bell(c, ['sync', '--as', 'codex']).code, 0);
-  assert.deepEqual(refsOf(sb, c, id), [`refs/bell/tomb/codex/${id}`]);
+  assert.deepEqual(shaped(refsOf(sb, c, id)), [...events(bare), `refs/bell/tomb/codex/${id}/*`], 'the tombstone, and the one event no tombstone keeps yet');
+  assert.equal(sb.bell(a, ['gc', '--older-than', '0d', '--as', 'codex']).code, 0);
+  assert.equal(sb.bell(a, ['sync', '--as', 'codex']).code, 0);
+  sb.git(sb.dir, 'clone', '-q', bare, 'd');
+  const d = join(sb.dir, 'd');
+  assert.equal(sb.bell(d, ['sync', '--as', 'codex']).code, 0);
+  assert.deepEqual(events(d), [], 'once gc folds that event too, a fresh clone gets only tombstones');
+  assert.deepEqual(statesOf(statusJson(sb, d, id), 'codex'), ['sent', 'delivered', 'read', 'deleted']);
 
   // import-h5i: the same letter must not be imported again once gc (or delete) removed it.
   const repo = sb.repo('h5i');
@@ -1326,7 +1342,7 @@ test('lifecycle: a tombstone keeps gc\'d mail from coming back through sync or i
   h5iLog(sb, repo, [line('h5i-1', 'imported once'), line('h5i-2', 'deleted unread')]);
   assert.match(sb.bell(repo, ['import-h5i']).out, /imported 2 letters/);
   assert.equal(sb.bell(repo, ['read', 'h5i-1', '--as', 'codex']).code, 0);
-  assert.match(sb.bell(repo, ['gc', '--older-than', '0d']).out, /deleted 1 message/);
+  assert.match(sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']).out, /deleted 1 message/);
   assert.equal(sb.bell(repo, ['delete', 'h5i-2', '--force', '--as', 'codex']).code, 0);
   const again = sb.bell(repo, ['import-h5i']);
   assert.equal(again.code, 0, again.err);
@@ -1360,8 +1376,8 @@ test('lifecycle: outbox shows each recipient\'s state, with a per-recipient brea
 
   const status = sb.bell(repo, ['status', all]);
   assert.match(status.out, new RegExp(`^git-bell: ${all} from alice to all: 3 recipients\\n`));
-  assert.match(status.out, new RegExp(`\\n  bob  +read  +sent ${T} → delivered ${T} \\(bob\\) → read ${T} UTC\\n`));
-  assert.match(status.out, new RegExp(`\\n  dave  +acked  +sent ${T} → acked ${T} \\(dave\\) UTC\\n`));
+  assert.match(status.out, new RegExp(`\\n  bob  +read  +sent ${T} UTC → delivered ${T} \\(bob\\) → read ${T}\\n`));
+  assert.match(status.out, new RegExp(`\\n  dave  +acked  +sent ${T} UTC → acked ${T} \\(dave\\)\\n`));
   const quiet = sentId(sb.bell(repo, ['send', 'all', 'anyone?', '--as', 'alice']));
   assert.match(sb.bell(repo, ['status', quiet]).out, /: no recipient has seen it yet\n/);
 }));
@@ -1415,14 +1431,16 @@ test('lifecycle: delete leaves a tombstone, needs --force for unread mail, and o
   assert.equal(del.out, `git-bell: deleted ${id}; its tombstone keeps sync and import-h5i from bringing it back\n`);
   const left = refsOf(sb, repo, id);
   assert.ok(!left.includes(`refs/bell/inbox/codex/${id}`), 'the letter ref is gone');
-  assert.ok(left.includes(`refs/bell/tomb/codex/${id}`));
+  assert.ok(shaped(left).includes(`refs/bell/tomb/codex/${id}/*`));
   assert.equal(left.filter((r) => r.startsWith(`refs/bell/event/codex/${id}/`) && r.includes('-deleted-')).length, 1);
   const s = statusJson(sb, repo, id);
   assert.equal(s.deleted, true);
   assert.equal(s.from, 'claude');
   assert.deepEqual(statesOf(s, 'codex'), ['sent', 'deleted']);
   assert.match(sb.bell(repo, ['delete', id, '--force', '--as', 'codex']).err, /already deleted/);
-  assert.deepEqual(outboxJson(sb, repo, 'claude').messages.map((m) => [m.id, m.deleted, m.recipients[0].state]), [[id, true, 'deleted']], 'the sender\'s outbox shows it deleted');
+  assert.deepEqual(outboxJson(sb, repo, 'claude').messages, [], 'outbox hides deleted letters, as inbox does');
+  const everything = JSON.parse(sb.bell(repo, ['outbox', '--all', '--json', '--as', 'claude']).out);
+  assert.deepEqual(everything.messages.map((m) => [m.id, m.deleted, m.recipients[0].state]), [[id, true, 'deleted']], 'outbox --all shows it deleted');
 
   // Once the recipient has read it, the sender may delete it without --force.
   const read = sentId(sb.bell(repo, ['send', 'codex', 'read me', '--as', 'claude']));
@@ -1437,19 +1455,19 @@ test('lifecycle: delete leaves a tombstone, needs --force for unread mail, and o
   assert.match(reader.err, /git bell archive/);
   assert.match(sb.bell(repo, ['delete', all, '--as', 'alice']).err, /--force/);
   assert.equal(sb.bell(repo, ['delete', all, '--force', '--as', 'alice']).code, 0);
-  assert.ok(sb.refs(repo).includes(`refs/bell/tomb/all/${all}`));
+  assert.ok(shaped(sb.refs(repo)).includes(`refs/bell/tomb/all/${all}/*`));
   assert.deepEqual(inboxJson(sb, repo, 'bob', ['--all']).messages, []);
 }));
 
-test('lifecycle: a v2 read mark reads as read and acked, and 2.1 still writes one beside its own events', () => withSandbox((sb) => {
+test('lifecycle: a v2 read mark reads as read and acked, and 2.1 still writes one beside each acked', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   const letter = (n, body) => ({ version: 1, id: `20250101-120000-aaaaa${n}`, ts: '2025-01-01T12:00:00.000Z', from: 'claude', to: 'codex', kind: 'msg', subject: '', body });
   const old = letter(1, 'read in v2');
   plant(sb, repo, old, { acks: ['codex'] });
   const fresh = letter(2, 'unread in v2');
-  const freshOid = plant(sb, repo, fresh);
+  plant(sb, repo, fresh);
   const later = letter(3, 'to be acked');
-  plant(sb, repo, later);
+  const laterOid = plant(sb, repo, later);
 
   assert.deepEqual(inboxJson(sb, repo, 'codex').messages.map((m) => m.id), [later.id, fresh.id], 'the v2 mark still means read');
   const was = recipient(statusJson(sb, repo, old.id), 'codex');
@@ -1460,18 +1478,19 @@ test('lifecycle: a v2 read mark reads as read and acked, and 2.1 still writes on
     { state: 'read', ts: old.ts, actor: 'codex', legacy: true },
     { state: 'acked', ts: old.ts, actor: 'codex', legacy: true },
   ]);
-  assert.match(sb.bell(repo, ['status', old.id]).out, /\n  sent 2025-01-01 12:00 → read \(codex, v2 mark\) → acked \(v2 mark\) UTC\n$/);
+  assert.match(sb.bell(repo, ['status', old.id]).out, /\n  sent 2025-01-01 12:00 UTC → read \(codex, v2 mark\) → acked \(v2 mark\)\n$/);
 
   const read = sb.bell(repo, ['read', old.id, '--as', 'codex']);
   assert.match(read.out, /read in v2/, 'existing mail stays readable');
   assert.equal(refsOf(sb, repo, old.id).filter((r) => r.startsWith('refs/bell/event/')).length, 0, 'and reading it again records nothing new');
 
-  // 2.1 writes a read event, plus the v2 mark for 2.0 clones; its events win over that mark.
+  // 2.1 writes a read event and no mark (2.1 reads a mark as acked); ack writes an
+  // acked event and the v2 mark for 2.0 clones, pointing at the letter.
   sb.bell(repo, ['read', fresh.id, '--as', 'codex']);
-  assert.equal(sb.git(repo, 'rev-parse', `refs/bell/ack/codex/${fresh.id}`), freshOid);
+  assert.ok(!sb.refs(repo).includes(`refs/bell/ack/codex/${fresh.id}`));
   assert.equal(recipient(statusJson(sb, repo, fresh.id), 'codex').state, 'read', 'not acked: read no longer implies it');
   sb.bell(repo, ['ack', later.id, '--as', 'codex']);
-  assert.ok(sb.refs(repo).includes(`refs/bell/ack/codex/${later.id}`));
+  assert.equal(sb.git(repo, 'rev-parse', `refs/bell/ack/codex/${later.id}`), laterOid);
   assert.deepEqual(statesOf(statusJson(sb, repo, later.id), 'codex'), ['sent', 'delivered', 'acked'], 'inbox saw it first');
   assert.deepEqual(outboxJson(sb, repo, 'claude').messages.map((m) => m.recipients[0].state), ['acked', 'read', 'acked']);
 }));
@@ -1486,18 +1505,18 @@ test('lifecycle: gc folds a deleted message\'s events into its tombstone, so the
   assert.equal(sb.bell(a, ['sync', '--as', 'claude']).code, 0);
   assert.equal(refsOf(sb, bare, id).length, 8);
 
-  const gc = sb.bell(a, ['gc', '--older-than', '0d']);
+  const gc = sb.bell(a, ['gc', '--older-than', '0d', '--as', 'codex']);
   assert.equal(gc.code, 0, gc.err);
-  assert.match(gc.out, /^git-bell: gc deleted 1 message, 1 read mark and 6 events older than 0d, leaving 1 tombstone; kept 0 unread, 0 read but newer, 0 broadcasts; packed refs\n$/);
-  assert.deepEqual(refsOf(sb, a, id), [`refs/bell/tomb/codex/${id}`], 'one ref for the whole history');
+  assert.match(gc.out, /^git-bell: gc deleted 1 message, folding 6 events and 1 read mark into tombstones; kept 0 unread, 0 read but newer than 0d, 0 archived, 0 broadcasts; packed refs\n$/);
+  assert.deepEqual(shaped(refsOf(sb, a, id)), [`refs/bell/tomb/codex/${id}/*`], 'one ref for the whole history');
   const s = statusJson(sb, a, id);
   assert.deepEqual(statesOf(s, 'codex'), ['sent', 'notified', 'delivered', 'read', 'archived', 'unarchived', 'acked', 'deleted'], 'the timeline survives inside the tombstone');
   assert.equal(recipient(s, 'codex').timeline.at(-1).via, 'gc');
 
   assert.equal(sb.bell(a, ['sync', '--as', 'claude']).code, 0);
-  assert.deepEqual(refsOf(sb, a, id), [`refs/bell/tomb/codex/${id}`], 'sync does not fetch the folded events back');
+  assert.deepEqual(shaped(refsOf(sb, a, id)), [`refs/bell/tomb/codex/${id}/*`], 'sync does not fetch the folded events back');
   const settled = sb.refs(a).length;
-  assert.equal(sb.bell(a, ['gc', '--older-than', '0d']).code, 0);
+  assert.equal(sb.bell(a, ['gc', '--older-than', '0d', '--as', 'codex']).code, 0);
   assert.equal(sb.refs(a).length, settled, 'a second gc changes nothing');
 
   // Many letters, one ref each once gc has run; a delete's events fold too.
@@ -1509,7 +1528,7 @@ test('lifecycle: gc folds a deleted message\'s events into its tombstone, so the
   const doomed = sentId(sb.bell(a, ['send', 'codex', 'deleted by hand', '--as', 'claude']));
   assert.equal(sb.bell(a, ['delete', doomed, '--force', '--as', 'claude']).code, 0);
   assert.equal(refsOf(sb, a, doomed).length, 2, 'delete leaves its event and the tombstone');
-  assert.equal(sb.bell(a, ['gc', '--older-than', '0d']).code, 0);
+  assert.equal(sb.bell(a, ['gc', '--older-than', '0d', '--as', 'codex']).code, 0);
   assert.equal(sb.refs(a).length, 7, 'seven deleted letters, seven tombstones, nothing else');
   assert.deepEqual(sb.refs(a).filter((r) => !r.startsWith('refs/bell/tomb/')), []);
 }));
@@ -1544,6 +1563,290 @@ test('lifecycle: no event or tombstone carries any text of the letter', () => wi
     return refs.length;
   };
   assert.ok(check() >= 10, 'events of every kind were checked');
-  assert.equal(sb.bell(repo, ['gc', '--older-than', '0d']).code, 0);
+  assert.equal(sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']).code, 0);
   assert.ok(check() >= 1, 'and the folded tombstones too');
+}));
+
+// ---------------------------------------------------------------- 2.1: review fixes
+
+// A hub and three clones: s is claude (the sender), a and b are two clones of codex.
+function senderAndTwoReaders(sb) {
+  const bare = join(sb.dir, 'hub.git');
+  sb.git(sb.dir, 'init', '-q', '--bare', bare);
+  const [s, a, b] = ['s', 'a', 'b'].map((c) => {
+    sb.git(sb.dir, 'clone', '-q', bare, c);
+    return join(sb.dir, c);
+  });
+  sb.git(s, 'config', 'bell.name', 'claude');
+  sb.git(a, 'config', 'bell.name', 'codex');
+  sb.git(b, 'config', 'bell.name', 'codex');
+  return { bare, s, a, b };
+}
+const ok = (r, what) => {
+  assert.equal(r.code, 0, `${what}: ${r.err}`);
+  return r;
+};
+const view = (sb, repo, id, name = 'codex') => recipient(statusJson(sb, repo, id), name);
+const freshClone = (sb, bare, name, as) => {
+  sb.git(sb.dir, 'clone', '-q', bare, name);
+  const repo = join(sb.dir, name);
+  sb.git(repo, 'config', 'bell.name', as);
+  ok(sb.bell(repo, ['sync']), `${name} sync`);
+  return repo;
+};
+
+test('review: two clones gc the same letter, and the ack only one of them had is kept everywhere', () => withSandbox((sb) => {
+  const { bare, s, a, b } = senderAndTwoReaders(sb);
+  const id = sentId(sb.bell(s, ['send', 'codex', 'please review']));
+  ok(sb.bell(s, ['sync']), 's sync');
+  for (const args of [['sync'], ['read', id], ['sync']]) ok(sb.bell(b, args), `b ${args[0]}`);
+  ok(sb.bell(a, ['sync']), 'a sync');
+  ok(sb.bell(b, ['ack', id]), 'b acks and does not sync');
+  ok(sb.bell(a, ['gc', '--older-than', '0d']), 'a gc');
+  ok(sb.bell(a, ['sync']), 'a sync');
+  ok(sb.bell(b, ['gc', '--older-than', '0d']), 'b gc');
+  assert.equal(view(sb, b, id).acked, true, 'positive control: b knows its own ack before it syncs');
+  for (const [name, repo] of [['b', b], ['s', s], ['a', a], ['b', b]]) ok(sb.bell(repo, ['sync']), `${name} sync`);
+  for (const [name, repo] of [['a', a], ['b', b], ['s', s]]) {
+    const v = view(sb, repo, id);
+    assert.equal(v.state, 'deleted', name);
+    assert.equal(v.acked, true, `${name} still sees that codex acked it`);
+    assert.equal(v.timeline.filter((e) => e.state === 'deleted').length, 1, `${name}: one deleted step, though two clones deleted it`);
+  }
+  const f = freshClone(sb, bare, 'f', 'claude');
+  assert.equal(view(sb, f, id).acked, true, 'a fresh clone sees the ack');
+  assert.deepEqual(refsOf(sb, f, id).filter((r) => !r.startsWith('refs/bell/tomb/')), [], 'and fetches only tombstones for the letter');
+  const settled = sb.refs(b);
+  ok(sb.bell(b, ['gc', '--older-than', '0d']), 'b gc again');
+  ok(sb.bell(b, ['sync']), 'b sync again');
+  assert.deepEqual(sb.refs(b), settled, 'a second gc and sync change nothing: folded events are not fetched back');
+}));
+
+test('review: events on a deleted letter keep syncing, so an ack made before or after the delete reaches every clone', () => withSandbox((sb) => {
+  const { bare, s, a, b } = senderAndTwoReaders(sb);
+  // b acks without syncing, then a's gc tombstone reaches b first.
+  const x = sentId(sb.bell(s, ['send', 'codex', 'first']));
+  ok(sb.bell(s, ['sync']), 's sync');
+  for (const args of [['sync'], ['read', x], ['sync']]) ok(sb.bell(b, args), `b ${args[0]}`);
+  ok(sb.bell(a, ['sync']), 'a sync');
+  ok(sb.bell(b, ['ack', x]), 'b ack');
+  ok(sb.bell(a, ['gc', '--older-than', '0d']), 'a gc');
+  ok(sb.bell(a, ['sync']), 'a sync');
+  const pushed = ok(sb.bell(b, ['sync']), 'b sync');
+  assert.match(pushed.out, /sent 0 messages, 1 read mark, 1 event/, 'the ack of a deleted letter is still sent');
+  ok(sb.bell(b, ['gc', '--older-than', '0d']), 'b gc');
+  assert.equal(view(sb, b, x).acked, true, 'b\'s gc folds its ack into a tombstone instead of dropping it');
+  ok(sb.bell(b, ['sync']), 'b sync');
+  ok(sb.bell(s, ['sync']), 's sync');
+  assert.equal(view(sb, s, x).acked, true, 'and the sender sees it');
+
+  // The recipient acks and syncs; the sender deletes without syncing first.
+  const y = sentId(sb.bell(s, ['send', 'codex', 'second']));
+  ok(sb.bell(s, ['sync']), 's sync');
+  for (const args of [['sync'], ['read', y], ['ack', y], ['sync']]) ok(sb.bell(b, args), `b ${args[0]}`);
+  ok(sb.bell(s, ['delete', y, '--force']), 's delete');
+  ok(sb.bell(s, ['sync']), 's sync');
+  assert.deepEqual(view(sb, s, y).timeline.map((e) => e.state), ['sent', 'delivered', 'read', 'acked', 'deleted'], 'the deleter learns of the ack');
+  const f = freshClone(sb, bare, 'f', 'claude');
+  assert.deepEqual(view(sb, f, y).timeline.map((e) => e.state), ['sent', 'delivered', 'read', 'acked', 'deleted'], 'so does a fresh clone');
+  assert.equal(refsOf(sb, f, y).filter((r) => r.startsWith('refs/bell/inbox/')).length, 0, 'which never fetches the letter');
+}));
+
+test('review: archive and unarchive order after every event they know of, so a clock ahead of this one cannot undo them', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const id = sentId(sb.bell(repo, ['send', 'codex', 'skewed', '--as', 'claude']));
+  const ahead = new Date(Date.now() + 3600 * 1000).toISOString();
+  plantEvent(sb, repo, { msg: id, to: 'codex', state: 'archived', ts: ahead, actor: 'codex', via: 'local' }, '20990101-000000-archived-aaaaaa');
+  assert.deepEqual(inboxJson(sb, repo, 'codex').messages, [], 'archived by a clone whose clock runs an hour ahead');
+  const un = ok(sb.bell(repo, ['unarchive', id, '--as', 'codex']), 'unarchive');
+  assert.equal(un.out, `git-bell: unarchived ${id} for codex\n`);
+  assert.deepEqual(inboxJson(sb, repo, 'codex').messages.map((m) => m.id), [id], 'unarchive took effect');
+  assert.equal(view(sb, repo, id).state, 'delivered', 'back where it was: that inbox delivered it');
+  ok(sb.bell(repo, ['archive', id, '--as', 'codex']), 'archive');
+  assert.equal(view(sb, repo, id).state, 'archived', 'and so does archive after it');
+
+  // An event dated past anything git-bell can order after: refused, not claimed.
+  const far = sentId(sb.bell(repo, ['send', 'codex', 'pinned', '--as', 'claude']));
+  plantEvent(sb, repo, { msg: far, to: 'codex', state: 'archived', ts: '9999-12-31T23:59:59.999Z', actor: 'codex', via: 'local' }, '99991231-235959-archived-bbbbbb');
+  const stuck = sb.bell(repo, ['unarchive', far, '--as', 'codex']);
+  assert.equal(stuck.code, 1, stuck.out);
+  assert.doesNotMatch(stuck.out, /unarchived/);
+  assert.match(stuck.err, /9999-12-31/);
+  assert.equal(view(sb, repo, far).state, 'archived');
+
+  // gc --older-than 0d means any age, even a date ahead of this clock.
+  const future = { version: 1, id: '20990101-000000-cccccc', ts: new Date(Date.now() + 2 * 86400 * 1000).toISOString(), from: 'claude', to: 'codex', kind: 'msg', subject: '', body: 'from a clock two days ahead' };
+  plant(sb, repo, future);
+  ok(sb.bell(repo, ['ack', future.id, '--as', 'codex']), 'ack');
+  ok(sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']), 'gc');
+  assert.equal(view(sb, repo, future.id).state, 'deleted');
+}));
+
+test('review: gc deletes only mail you sent or received, and never archived mail or mail read privately', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const theirs = sentId(sb.bell(repo, ['send', 'codex', 'keep this for reference', '--as', 'claude']));
+  ok(sb.bell(repo, ['read', theirs, '--as', 'codex']), 'read');
+  const kept = ok(sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'cursor']), 'cursor gc');
+  assert.match(kept.out, /kept .*1 not yours/);
+  assert.deepEqual(inboxJson(sb, repo, 'codex', ['--all']).messages.map((m) => m.id), [theirs], 'another name\'s gc deletes nothing of codex\'s mail');
+  assert.equal(sb.refs(repo).filter((r) => r.startsWith('refs/bell/tomb/')).length, 0);
+  const nobody = sb.bell(repo, ['gc', '--older-than', '0d']);
+  assert.equal(nobody.code, 2, 'gc needs to know who you are');
+  assert.match(nobody.err, /--as/);
+
+  const archived = sentId(sb.bell(repo, ['send', 'codex', 'archive me', '--as', 'claude']));
+  ok(sb.bell(repo, ['read', archived, '--as', 'codex']), 'read');
+  ok(sb.bell(repo, ['archive', archived, '--as', 'codex']), 'archive');
+  sb.git(repo, 'config', 'bell.receipts', 'false');
+  const privately = sentId(sb.bell(repo, ['send', 'codex', 'read in private', '--as', 'claude']));
+  ok(sb.bell(repo, ['read', privately, '--as', 'codex']), 'read privately');
+  sb.git(repo, 'config', '--unset', 'bell.receipts');
+
+  const gc = ok(sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']), 'codex gc');
+  assert.match(gc.out, /^git-bell: gc deleted 1 message,/);
+  assert.match(gc.out, /kept 0 unread, 0 read but newer than 0d, 1 archived, 0 broadcasts, 1 read privately;/);
+  assert.equal(view(sb, repo, theirs).state, 'deleted', 'the owner\'s gc deletes the letter it read');
+  assert.deepEqual(inboxJson(sb, repo, 'codex', ['--archived']).messages.map((m) => m.id), [archived], 'archived mail stays');
+  assert.equal(view(sb, repo, privately).state, 'read', 'mail read privately stays: a tombstone would tell the sender it was read');
+}));
+
+test('review: a ref in a tombstone\'s way, or a tombstone entry this version cannot read, never wedges gc or brings a letter back', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const x = sentId(sb.bell(repo, ['send', 'codex', 'one', '--as', 'claude']));
+  const y = sentId(sb.bell(repo, ['send', 'codex', 'two', '--as', 'claude']));
+  ok(sb.bell(repo, ['ack', '--all', '--as', 'codex']), 'ack --all');
+  sb.git(repo, 'update-ref', `refs/bell/tomb/codex/${x}`, sb.git(repo, 'rev-parse', `refs/bell/inbox/codex/${x}`));
+  const gc = ok(sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex']), 'gc');
+  assert.match(gc.err, new RegExp(`refs/bell/tomb/codex/${x} is in the way`));
+  assert.ok(sb.refs(repo).includes(`refs/bell/inbox/codex/${x}`), 'the letter behind it is kept');
+  assert.ok(!sb.refs(repo).includes(`refs/bell/inbox/codex/${y}`), 'and every other letter is still collected');
+  const del = sb.bell(repo, ['delete', x, '--as', 'codex']);
+  assert.equal(del.code, 1);
+  assert.match(del.err, /is in the way/);
+  assert.doesNotMatch(del.err, /cannot lock ref/);
+
+  // A tombstone from a newer git-bell, with an entry this one does not know.
+  const { bare, a, b } = hubAndClones(sb);
+  const z = sentId(sb.bell(a, ['send', 'codex', 'obsolete', '--as', 'claude']));
+  ok(sb.bell(a, ['sync', '--as', 'claude']), 'a sync');
+  ok(sb.bell(b, ['sync', '--as', 'codex']), 'b sync');
+  const sent = sb.git(a, 'log', '-1', '--format=%aI', `refs/bell/inbox/codex/${z}`);
+  const tomb = {
+    v: 1, kind: 'tomb', msg: z, to: 'codex', from: 'claude', sent: new Date(sent).toISOString(),
+    trail: [
+      { id: '20260925-000000-snoozed-abcdef', to: 'codex', state: 'snoozed', ts: new Date(sent).toISOString(), actor: 'codex', via: 'local' },
+      { id: '20260925-000001-deleted-abcdef', to: 'codex', state: 'deleted', ts: new Date(sent).toISOString(), actor: 'codex', via: 'local' },
+    ],
+  };
+  const secs = Math.floor(Date.parse(sent) / 1000);
+  const oid = sb.gitWith(a, ['hash-object', '-t', 'commit', '-w', '--stdin'], { input: `tree ${EMPTY_TREE}\nauthor codex <codex@bell> ${secs} +0000\ncommitter bell <bell@bell> ${secs} +0000\n\n${JSON.stringify(tomb)}\n` });
+  sb.git(a, 'update-ref', `refs/bell/tomb/codex/${z}/20260925-000001-tomb-abcdef`, oid);
+  sb.git(a, 'push', '-q', 'origin', `refs/bell/tomb/codex/${z}/20260925-000001-tomb-abcdef:refs/bell/tomb/codex/${z}/20260925-000001-tomb-abcdef`);
+  ok(sb.bell(b, ['sync', '--as', 'codex']), 'b sync');
+  assert.deepEqual(inboxJson(sb, b, 'codex', ['--all']).messages, [], 'the tombstone still buries its letter');
+  assert.equal(view(sb, b, z).state, 'deleted');
+  const f = freshClone(sb, bare, 'f', 'codex');
+  assert.equal(refsOf(sb, f, z).filter((r) => r.startsWith('refs/bell/inbox/')).length, 0, 'and a fresh clone never fetches it');
+}));
+
+test('review: a 2.0 read mark reads as read and acked; ack still records a real ack, and a later read never takes acked back', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const letter = (n) => ({ version: 1, id: `20250101-120000-ddddd${n}`, ts: '2025-01-01T12:00:00.000Z', from: 'claude', to: 'codex', kind: 'msg', subject: '', body: `letter ${n}` });
+  const old = letter(1);
+  plant(sb, repo, old, { acks: ['codex'] });
+  const acked = sb.bell(repo, ['ack', old.id, '--as', 'codex']);
+  assert.equal(acked.out, 'git-bell: acked 1 message for codex (handled)\n');
+  assert.equal(refsOf(sb, repo, old.id).filter((r) => r.includes('-acked-')).length, 1, 'ack after a 2.0 read writes a real acked event');
+  assert.deepEqual(statesOf(statusJson(sb, repo, old.id), 'codex'), ['sent', 'acked']);
+  assert.equal(sb.bell(repo, ['ack', old.id, '--as', 'codex']).out, `git-bell: ${old.id} is already acked for codex\n`, 'a second ack says so');
+  assert.equal(refsOf(sb, repo, old.id).filter((r) => r.includes('-acked-')).length, 1);
+
+  // A read writes no 2.0 mark; only ack does, so a mark never claims more than was said.
+  const fresh = letter(2);
+  plant(sb, repo, fresh);
+  ok(sb.bell(repo, ['read', fresh.id, '--as', 'codex']), 'read');
+  assert.ok(!sb.refs(repo).includes(`refs/bell/ack/codex/${fresh.id}`), 'no mark beside a read');
+  ok(sb.bell(repo, ['ack', fresh.id, '--as', 'codex']), 'ack');
+  assert.ok(sb.refs(repo).includes(`refs/bell/ack/codex/${fresh.id}`), 'a mark beside an ack');
+
+  // A 2.0 read, then a 2.1 read of a clone that had not seen the mark: still acked.
+  const mixed = letter(3);
+  plant(sb, repo, mixed);
+  plantEvent(sb, repo, { msg: mixed.id, to: 'codex', state: 'read', ts: '2025-01-02T00:00:00.000Z', actor: 'codex', via: 'local' }, '20250102-000000-read-eeeeee');
+  const before = view(sb, repo, mixed.id).state;
+  sb.git(repo, 'update-ref', `refs/bell/ack/codex/${mixed.id}`, sb.git(repo, 'rev-parse', `refs/bell/inbox/codex/${mixed.id}`));
+  assert.deepEqual([before, view(sb, repo, mixed.id).state], ['read', 'acked'], 'the 2.0 mark adds acked');
+  assert.deepEqual(statesOf(statusJson(sb, repo, mixed.id), 'codex'), ['sent', 'read', 'acked'], 'the mark has no time of its own, so it goes after the recorded events');
+}));
+
+test('review: the timeline shows each state once, names who deleted or archived, and puts UTC on the first time', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const id = sentId(sb.bell(repo, ['send', 'all', 'standup at 3', '--as', 'alice']));
+  const t = new Date().toISOString();
+  plantEvent(sb, repo, { msg: id, to: 'bob', state: 'delivered', ts: t, actor: 'bob', via: 'sync' }, '20260101-000000-delivered-aaaaa1');
+  plantEvent(sb, repo, { msg: id, to: 'bob', state: 'delivered', ts: t, actor: 'bob', via: 'sync' }, '20260101-000000-delivered-aaaaa2');
+  ok(sb.bell(repo, ['reply', id, 'see you', '--as', 'bob']), 'reply');
+  ok(sb.bell(repo, ['archive', id, '--as', 'bob']), 'archive');
+  assert.deepEqual(statesOf(statusJson(sb, repo, id), 'bob'), ['sent', 'delivered', 'read', 'replied', 'archived'], 'two clones\' delivered read as one, and read comes before the reply it came with');
+  const text = sb.bell(repo, ['status', id]).out;
+  assert.match(text, new RegExp(`\\n  bob  archived  sent \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC → delivered ${T} \\(bob\\) → read ${T} → replied ${T} → archived ${T} \\(bob\\)\\n`));
+
+  const direct = sentId(sb.bell(repo, ['send', 'codex', 'bye', '--as', 'claude']));
+  ok(sb.bell(repo, ['read', direct, '--as', 'codex']), 'read');
+  ok(sb.bell(repo, ['delete', direct, '--as', 'codex']), 'delete');
+  assert.match(sb.bell(repo, ['status', direct]).out, new RegExp(`\\n  sent ${T} UTC → read ${T} \\(codex\\) → deleted ${T} \\(codex\\)\\n$`), 'the recipient deleted it, and says so');
+}));
+
+test('review: ack --all marks read mail handled too, and inbox tells unread, read and handled apart', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const [one, two, three] = ['one', 'two', 'three'].map((w) => sentId(sb.bell(repo, ['send', 'codex', w, '--as', 'claude'])));
+  ok(sb.bell(repo, ['read', one, '--as', 'codex']), 'read');
+  const all = ok(sb.bell(repo, ['ack', '--all', '--as', 'codex']), 'ack --all');
+  assert.equal(all.out, 'git-bell: acked 3 messages for codex (handled)\n');
+  assert.deepEqual(outboxJson(sb, repo, 'claude').messages.map((m) => m.recipients[0].state), ['acked', 'acked', 'acked']);
+  assert.equal(sb.bell(repo, ['ack', '--all', '--as', 'codex']).out, 'git-bell: acked 0 messages for codex (handled)\n');
+
+  const four = sentId(sb.bell(repo, ['send', 'codex', 'four', '--as', 'claude']));
+  const five = sentId(sb.bell(repo, ['send', 'codex', 'five', '--as', 'claude']));
+  ok(sb.bell(repo, ['read', five, '--as', 'codex']), 'read');
+  const listing = sb.bell(repo, ['inbox', '--all', '--as', 'codex']).out;
+  for (const [mark, id] of [['*', four], [' ', five], ['✓', one], ['✓', two], ['✓', three]]) {
+    assert.match(listing, new RegExp(`\\n  \\${mark} ${id}  `), `${mark} ${id}`);
+  }
+
+  ok(sb.bell(repo, ['archive', four, '--as', 'codex']), 'archive');
+  const plain = sb.bell(repo, ['inbox', '--as', 'codex']).out;
+  assert.equal(plain, 'git-bell: no unread mail for codex\n  (1 archived: git bell inbox --archived)\n', 'plain inbox says archived mail exists');
+  const archived = sb.bell(repo, ['inbox', '--archived', '--as', 'codex']).out;
+  assert.match(archived, /read one: git bell read <id>\n$/, 'no "(or just: git bell read)", which cannot read archived mail');
+}));
+
+test('review: a deleted id says so everywhere, and outbox hides deleted letters unless --all', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const id = sentId(sb.bell(repo, ['send', 'codex', 'short-lived', '--subject', 'gone soon', '--as', 'claude']));
+  ok(sb.bell(repo, ['read', id, '--as', 'codex']), 'read');
+  ok(sb.bell(repo, ['delete', id, '--as', 'codex']), 'delete');
+  for (const args of [['read', id], ['reply', id, 'too late'], ['ack', id], ['archive', id], ['unarchive', id], ['verify', id]]) {
+    const r = sb.bell(repo, [...args, '--as', 'codex']);
+    assert.equal(r.code, 1, args[0]);
+    assert.match(r.err, new RegExp(`^git-bell: ${id} was deleted by codex \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC \\(git bell status ${id}\\)\\n$`), args[0]);
+  }
+  const kept = sentId(sb.bell(repo, ['send', 'codex', 'still here', '--as', 'claude']));
+  assert.deepEqual(outboxJson(sb, repo, 'claude').messages.map((m) => m.id), [kept], 'outbox hides deleted letters');
+  const all = sb.bell(repo, ['outbox', '--all', '--as', 'claude']);
+  assert.match(all.out, new RegExp(`${id}  -> codex  deleted \\(read\\)  \\(text deleted\\)\\n`));
+  const b = sentId(sb.bell(repo, ['send', 'all', 'standup', '--as', 'alice']));
+  assert.doesNotMatch(sb.bell(repo, ['delete', b, '--as', 'alice']).err, /git-bell: git-bell/);
+}));
+
+test('review: help and README say what the code does', () => withSandbox((sb) => {
+  const help = sb.bell(sb.dir, ['help']).out;
+  assert.match(help, /delete <id> \[--force\] .*\n +\(--force if unread; always for a broadcast\)/);
+  assert.match(help, /ack <id> \| --all .*everything not yet acked/);
+  assert.match(help, /bell\.receipts false/);
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  assert.match(readme, /`git bell archive <id>` \/ `git bell unarchive <id>`/);
+  assert.match(readme, /once, by the first clone that sees it/);
+  const receipts = readme.split('\n').find((l) => l.startsWith('- **Receipts.**'));
+  assert.match(receipts, /extensions\.worktreeConfig true/, 'git config --worktree needs worktreeConfig in a repo with worktrees');
 }));

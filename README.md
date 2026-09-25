@@ -169,19 +169,19 @@ git config bell.ring.<name> '["program", "arg", "{notice}"]'
 | command | what it does |
 | --- | --- |
 | `git bell send <to> <text...> [--subject s] [--kind k] [--sign]` | leave a letter. `all` broadcasts, and text `-` reads stdin |
-| `git bell inbox [--all] [--archived] [--json]` | list unread mail, newest first. Broadcasts are included, `--all` adds mail you've read, and `--archived` lists archived mail instead |
+| `git bell inbox [--all] [--archived] [--json]` | list unread mail, newest first. Broadcasts are included, `--all` adds mail you've read (`*` unread, `✓` handled), and `--archived` lists archived mail instead |
 | `git bell read [id]` | show a letter and mark it read. With no id it shows the oldest unread one |
 | `git bell reply <id> <text...>` | answer the sender and mark the original read. On your own letter, it follows up to the same recipient |
-| `git bell ack <id>` / `git bell ack --all` | mark your mail handled without showing it, which also takes it out of unread |
-| `git bell archive <id>` / `unarchive <id>` | hide a letter from `inbox` and `ring`, or put it back |
-| `git bell delete <id> [--force]` | delete a letter for good, leaving a tombstone. Unread mail needs `--force` |
+| `git bell ack <id>` / `git bell ack --all` | mark your mail handled without showing it, which also takes it out of unread. `--all` covers everything not acked yet, read or not |
+| `git bell archive <id>` / `git bell unarchive <id>` | hide a letter from `inbox` and `ring`, or put it back |
+| `git bell delete <id> [--force]` | delete a letter for good, leaving a tombstone. Unread mail, and any broadcast, needs `--force` |
 | `git bell status <id> [--json]` | a letter's timeline, per recipient (see [Message lifecycle](#message-lifecycle)) |
-| `git bell outbox [--json]` | what you sent, and where each recipient is with it |
+| `git bell outbox [--all] [--json]` | what you sent, and where each recipient is with it (`--all` adds deleted letters) |
 | `git bell ring` | one line if there is unread mail, otherwise silence (exit 0) |
 | `git bell watch [--interval s]` | print one line per new letter (polls every 3s by default) |
 | `git bell sync [remote]` | exchange mail with a git remote (`origin` by default) |
 | `git bell who` | list the names seen in this mailbox, and which one is you |
-| `git bell gc [--older-than 30d] [--dry-run]` | delete old mail its owner has read, then pack refs (see [Scaling](#scaling)) |
+| `git bell gc [--older-than 30d] [--dry-run]` | delete old mail you sent or received once its owner has read it, then pack refs (see [Scaling](#scaling)) |
 | `git bell verify <id>` | say whether a letter is signed, and whether the signature is valid |
 | `git bell import-h5i` | copy an h5i `refs/h5i/msg` log into letters (see [Coming from h5i](#coming-from-h5i)) |
 | `git bell hooks <claude\|codex\|cursor>` | print a session-start setup snippet |
@@ -232,7 +232,7 @@ Whatever happens to a letter after it is sent is an *event*: a small empty-tree 
 | state | when |
 | --- | --- |
 | `sent` | the letter exists (no event) |
-| `delivered` | the recipient's clone first sees it, in `sync`, `inbox`, `ring` or `watch` (once per clone) |
+| `delivered` | the recipient's clone first sees it, in `sync`, `inbox`, `ring` or `watch` (once, by the first clone that sees it) |
 | `notified`, `ring-failed` | the [ring bridge](#ring-a-live-session-optional) reached them, or failed to |
 | `read` | they opened it with `read`, or answered it with `reply` |
 | `acked` | they ran `ack`: handled. Reading no longer implies it |
@@ -243,12 +243,12 @@ Whatever happens to a letter after it is sent is an *event*: a small empty-tree 
 ```text
 $ git bell status 20260925-130231-a0c89f
 git-bell: 20260925-130231-a0c89f from claude to codex: archived
-  sent 2026-09-25 13:02 → delivered 13:05 (codex) → read 13:07 → archived 14:30 UTC
+  sent 2026-09-25 13:02 UTC → delivered 13:05 (codex) → read 13:07 → archived 14:30 (codex)
 ```
 
-- **Receipts.** `delivered`, `read` and `acked` sync back, so the sender sees them. `git config bell.receipts false` (add `--worktree` for one identity) keeps your `delivered` and `read` from then on under `refs/bell/local/`, which sync never sends. `acked` is said on purpose, so it is always shared. Worktrees of one repo share refs, so they still see each other's receipts.
-- **Deleting.** `git bell delete <id>` works for the sender or the recipient, or for a broadcast its sender, and needs `--force` while the recipient hasn't read the letter. It removes the letter and leaves a tombstone, `refs/bell/tomb/<to>/<id>`: the letter's sender, date and shared events, without its text. Only the tombstone travels, and no clone fetches or imports that letter again.
-- **From 2.0.** A 2.0 read mark, `refs/bell/ack/<reader>/<id>`, reads as `read` and `acked`, since 2.0 wrote the same mark for both; the reader's own events win once there are any. 2.1 still writes that mark beside each shared `read` and `acked`, so a 2.0 clone of the same reader sees the letter as read. 2.2 will stop.
+- **Receipts.** `delivered`, `read` and `acked` sync back, so the sender sees them. `git config bell.receipts false` keeps your `delivered` and `read` from then on under `refs/bell/local/`, which sync never sends, and `gc` leaves mail you read that way alone, since a tombstone would tell. `acked` is said on purpose, so it is always shared. The setting is per clone, or per worktree (first `git config extensions.worktreeConfig true`, as in [Names](#set-up-your-agents), then `git config --worktree bell.receipts false`), not per name; worktrees share refs, so they still see each other's receipts.
+- **Deleting.** `git bell delete <id>` works for the sender or the recipient, or for a broadcast its sender, and needs `--force` while the recipient hasn't read the letter. It removes the letter and leaves a tombstone, `refs/bell/tomb/<to>/<id>/<tomb-id>`: the letter's sender, date and shared events, without its text. Each deletion writes its own, so clones never overwrite each other's; any one keeps every clone from fetching or importing the letter again, and its events still sync.
+- **From 2.0.** A 2.0 read mark, `refs/bell/ack/<reader>/<id>`, reads as `read` and `acked`, since 2.0 wrote the same mark for both, until the reader acks for real (`ack` records it). 2.1 writes that mark only beside `acked`, since beside a `read` it would claim the letter was handled, so a 2.0 clone of the same reader sees handled mail as read. 2.2 will stop.
 
 ## Sync across machines
 
@@ -261,7 +261,7 @@ git bell sync backup
 
 `sync` reports how many letters, read marks and events it received and sent. If a new letter is waiting for you, it also prints your ring line. A plain `git clone` doesn't copy mail, so run `git bell sync` in each clone. In a repo without a remote, `sync` says so and your mail stays local.
 
-`sync` only adds. It never deletes a ref on either side, even when `fetch.prune` is on, so mail you haven't synced yet is safe. It moves only refs shaped like mail (`refs/bell/inbox|ack|tomb/<name>/<id>` and `refs/bell/event/<name>/<id>/<event-id>`), never `refs/bell/local/`; anything else under `refs/bell/` on the remote is ignored and reported.
+`sync` only adds. It never deletes a ref on either side, even when `fetch.prune` is on, so mail you haven't synced yet is safe. It moves only refs shaped like mail (`refs/bell/inbox|ack/<name>/<id>` and `refs/bell/event|tomb/<name>/<id>/<event-id>`), never `refs/bell/local/`; anything else under `refs/bell/` on the remote is ignored and reported.
 
 **sync pushes your mail to the remote.** On a public repo, anyone can fetch it, even though the web UI doesn't show these refs. Keep secrets out of letters, as you would out of commits.
 
@@ -278,11 +278,11 @@ Clear the remote as well as your clone, or the next `git bell sync` brings the m
 
 h5i's design notes argued against one ref per message: "Don't use one ref per message. Git's packed-refs scans linearly and loose refs burn inodes." git-bell keeps one ref per letter on purpose and answers with housekeeping:
 
-- **Events cost refs.** Each event is one ref (and a 2.1 read is two, with the 2.0 read mark), so a busy letter has several refs until gc folds them.
-- **gc trims, folds and packs.** `git bell gc` deletes letters their owner has read that are older than 30 days (`--older-than` changes that), leaving a tombstone for each, and folds a deleted letter's events and read marks into that one tombstone, so it costs one ref and `status` can still show its timeline. A letter deleted earlier folds once its deletion is older than the cutoff. Then gc runs `git pack-refs --all` to move the loose ref files into one `packed-refs` file. It never deletes unread mail or broadcasts, and `--dry-run` only counts.
+- **Events cost refs.** Each event is one ref (and an ack is two, with the 2.0 read mark), so a busy letter has several refs until gc folds them.
+- **gc trims, folds and packs.** `git bell gc` deletes letters you sent or received that their owner has read and that are older than 30 days (`--older-than` changes that; `0d` means any age), leaving a tombstone for each, and folds a deleted letter's events and read marks into tombstones, so `status` can still show its timeline. An event no tombstone keeps yet (one that synced in later) goes into a new one: gc never drops an event. A letter deleted earlier folds once its deletion is older than the cutoff. Then gc runs `git pack-refs --all` to move the loose ref files into one `packed-refs` file. It never deletes unread, archived or privately read mail, broadcasts, or anyone else's mail (it does nothing for everyone that `delete` would refuse you), and `--dry-run` only counts.
 - **reftable works.** A repo in git's reftable format (`git init --ref-format=reftable`) keeps refs in compact tables with no file per ref, and git-bell runs on it unchanged (checked with git 2.53, `gc` included).
 - **sync lists every ref.** `git bell sync` asks the remote for all of `refs/bell/*` each time, so it slows as a shared mailbox grows. An ordinary `git fetch` over protocol v2, the default in current git, asks only for the refs it wants, so mail doesn't weigh on branch fetches.
-- **Tombstones travel; sync still never deletes.** A letter `gc` or `delete` removed stays gone: sync shares its tombstone, and no 2.1 clone fetches or imports it again (a 2.0 clone knows nothing of tombstones). The remote keeps its copy of the letter and its events until you delete them there (see Clearing mail in [Sync across machines](#sync-across-machines)).
+- **Tombstones travel; sync still never deletes.** A letter `gc` or `delete` removed stays gone: sync shares its tombstones, usually one or two per letter, and no 2.1 clone fetches or imports it again (a 2.0 clone knows nothing of tombstones). Sync skips events a tombstone already keeps, so folded events stay folded. The remote keeps its copy of the letter and its events until you delete them there (see Clearing mail in [Sync across machines](#sync-across-machines)).
 
 ## Trust: what git-bell does not promise
 
