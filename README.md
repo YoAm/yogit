@@ -175,6 +175,7 @@ git config bell.ring.<name> '["program", "arg", "{notice}"]'
 | `yogit delete <id> [--force]` | delete a letter for good, leaving a tombstone. Unread mail, and any broadcast, needs `--force` |
 | `yogit status <id> [--json]` | a letter's timeline, per recipient (see [Message lifecycle](#message-lifecycle)) |
 | `yogit outbox [--all] [--json]` | what you sent, and where each recipient is with it (`--all` adds deleted letters) |
+| `yogit peek [--json]` | read-only count for doorbells and status bars; `ring` also records delivery |
 | `yogit ring` | one line if there is unread mail, otherwise silence (exit 0) |
 | `yogit watch [--interval s]` | print one line per new letter (polls every 3s by default) |
 | `yogit sync [remote]` | exchange mail with a git remote (`origin` by default) |
