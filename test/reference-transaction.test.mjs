@@ -46,7 +46,10 @@ function fixture(t, { format = 'sha1', bare = false } = {}) {
     const configure = value => git(['config', '--local', 'bell.hookName', value]);
     function run(input, state = 'committed') {
         const result = spawnSync('sh', [hook, state], { cwd, env, input, encoding: 'utf8', timeout: 10000 });
-        assert.ifError(result.error);
+        // Ignored phases exit before reading stdin; the writer can lose that
+        // race with EPIPE even though the hook succeeded. Committed phases
+        // must still drain their input, including the large-transaction test.
+        if (!(state !== 'committed' && result.status === 0 && result.error?.code === 'EPIPE')) assert.ifError(result.error);
         assert.equal(result.status, 0, result.stderr);
         assert.equal(result.stdout, '');
         return result.stderr;

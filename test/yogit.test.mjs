@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -2670,4 +2670,425 @@ test('peek: read-only count for doorbells and status bars', () => withSandbox((s
   sb.git(repo, 'update-ref', 'refs/bell/inbox/codex/bogus', sb.git(repo, 'hash-object', '-w', '--stdin'));
   assert.equal(JSON.parse(sb.bell(repo, ['peek', '--json', '--as', 'codex']).out).malformed, 1);
   assert.equal(JSON.parse(sb.bell(repo, ['peek', '--json', '--as', 'alice']).out).malformed, 0);
+}));
+
+// ---------------------------------------------------------------- opt-in gc
+
+const gcLetter = (id, changes = {}) => ({
+  version: 1, id, ts: '2020-01-01T00:00:00.000Z', from: 'claude', to: 'codex',
+  kind: 'msg', subject: 'SECRET-GC-SUBJECT', body: 'SECRET-GC-BODY', ...changes,
+});
+const letterRef = (m) => `refs/bell/inbox/${m.to}/${m.id}`;
+const changedSource = (from, to, source = SOURCE) => {
+  assert.equal(source.split(from).length, 2, `negative control must change exactly one source site: ${from}`);
+  return source.replace(from, to);
+};
+function scriptWith(sb, name, source) {
+  const path = join(sb.dir, `${name}.mjs`);
+  writeFileSync(path, source);
+  return path;
+}
+
+test('gc expiry is opt-in: old unread mail expires, with archived, private, broadcast and foreign mail protected', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const recent = new Date().toISOString();
+  const letters = [
+    gcLetter('expire-old-unread'),
+    gcLetter('expire-outgoing', { from: 'codex', to: 'claude' }),
+    gcLetter('expire-old-read'),
+    gcLetter('expire-young-unread', { ts: recent }),
+    gcLetter('expire-young-read', { ts: recent }),
+    gcLetter('expire-archived-unread'),
+    gcLetter('expire-archived-read'),
+    gcLetter('expire-private-read'),
+    gcLetter('expire-broadcast', { from: 'codex', to: 'all' }),
+    gcLetter('expire-foreign-unread', { from: 'alice', to: 'bob' }),
+    gcLetter('expire-foreign-read', { from: 'alice', to: 'bob' }),
+  ];
+  for (const m of letters) plant(sb, repo, m, { acks: ['expire-old-read', 'expire-young-read', 'expire-archived-read', 'expire-foreign-read'].includes(m.id) ? [m.to] : [] });
+  for (const id of ['expire-archived-unread', 'expire-archived-read']) ok(sb.bell(repo, ['archive', id, '--as', 'codex']), 'archive');
+  sb.git(repo, 'config', 'bell.receipts', 'false');
+  ok(sb.bell(repo, ['read', 'expire-private-read', '--as', 'codex']), 'private read');
+  sb.git(repo, 'config', '--unset', 'bell.receipts');
+  const before = sb.git(repo, 'for-each-ref', 'refs/bell');
+  const dry = ok(sb.bell(repo, ['gc', '--expire-unread', '30d', '--dry-run', '--as', 'codex']), 'dry expiry');
+  assert.match(dry.out, /would delete 3 messages/);
+  assert.match(dry.out, /would expire 2 messages/);
+  assert.equal(sb.git(repo, 'for-each-ref', 'refs/bell'), before, 'dry expiry changes neither letter refs nor event refs');
+  assert.equal(existsSync(join(repo, '.git', 'packed-refs')), false);
+
+  const run = ok(sb.bell(repo, ['gc', '--expire-unread', '30d', '--as', 'codex']), 'expiry');
+  assert.match(run.out, /deleted 3 messages/);
+  assert.match(run.out, /expired 2 messages/);
+  const retired = new Set(['expire-old-unread', 'expire-outgoing', 'expire-old-read']);
+  assert.deepEqual(sb.refs(repo, 'refs/bell/inbox'), letters.filter((m) => !retired.has(m.id)).map(letterRef).sort());
+  for (const id of ['expire-old-unread', 'expire-outgoing']) {
+    const who = id === 'expire-outgoing' ? 'claude' : 'codex';
+    const state = view(sb, repo, id, who);
+    assert.equal(state.state, 'expired');
+    assert.equal(state.read, false, 'expiration never invents a read receipt');
+    const expired = state.timeline.find((e) => e.state === 'expired');
+    assert.equal(expired.actor, 'codex');
+    assert.equal(expired.via, 'gc');
+    assert.match(sb.bell(repo, ['status', id]).out, /expired/);
+    const events = refsOf(sb, repo, id).filter((r) => r.startsWith('refs/bell/event/'));
+    assert.equal(events.length, 1, 'expiry writes the ordinary event format as well as the tombstone');
+    const eventRaw = sb.git(repo, 'cat-file', 'commit', events[0]);
+    assert.doesNotMatch(eventRaw, /SECRET-GC/);
+    const event = JSON.parse(eventRaw.slice(eventRaw.indexOf('\n\n') + 2));
+    assert.equal(event.kind, 'event');
+    assert.equal(event.state, 'expired');
+    assert.deepEqual(Object.keys(event), ['v', 'kind', 'msg', 'to', 'state', 'ts', 'actor', 'via']);
+    const tombs = refsOf(sb, repo, id).filter((r) => r.startsWith('refs/bell/tomb/'));
+    assert.equal(tombs.length, 1, 'one readable tombstone keeps the expired letter retired');
+    const raw = sb.git(repo, 'cat-file', 'commit', tombs[0]);
+    assert.doesNotMatch(raw, /SECRET-GC/);
+    const tomb = JSON.parse(raw.slice(raw.indexOf('\n\n') + 2));
+    assert.ok(tomb.trail.some((e) => e.state === 'expired'));
+    assert.ok(tomb.trail.some((e) => e.state === 'deleted'), 'older readers still understand its tombstone');
+    for (const e of tomb.trail) assert.ok(Object.keys(e).every((k) => ['id', 'to', 'state', 'ts', 'actor', 'via', 'legacy'].includes(k)));
+  }
+  assert.equal(view(sb, repo, 'expire-old-read').state, 'deleted', 'ordinary read gc keeps its existing state');
+  const outbox = JSON.parse(ok(sb.bell(repo, ['outbox', '--all', '--json', '--as', 'claude']), 'outbox').out);
+  assert.equal(outbox.messages.find((m) => m.id === 'expire-old-unread').recipients[0].state, 'expired');
+  assert.match(sb.bell(repo, ['outbox', '--all', '--as', 'claude']).out, /expire-old-unread.*expired/);
+  assert.ok(!outboxJson(sb, repo, 'claude').messages.some((m) => m.id === 'expire-old-unread'), 'default outbox hides retired mail');
+  const settled = sb.refs(repo, 'refs/bell/tomb');
+  ok(sb.bell(repo, ['gc', '--expire-unread', '30d', '--as', 'codex']), 'repeat expiry');
+  assert.deepEqual(sb.refs(repo, 'refs/bell/tomb'), settled, 'repeating expiry does not grow tombstones');
+}));
+
+test('gc expiry rejects invalid and missing ages without modifying refs', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  plant(sb, repo, gcLetter('expiry-validation'));
+  const before = sb.git(repo, 'for-each-ref', 'refs/bell');
+  for (const args of [['--expire-unread'], ['--expire-unread', '--dry-run'], ...['', '-1d', 'tomorrow', '1.5d', '1y', '999999999999999999999d'].map((age) => [`--expire-unread=${age}`])]) {
+    assert.equal(sb.bell(repo, ['gc', '--as', 'codex', ...args]).code, 2, args.join(' '));
+    assert.equal(sb.git(repo, 'for-each-ref', 'refs/bell'), before);
+  }
+}));
+
+test('gc expiry preserves v2.2 hex-prefix lookup for tombstone status and read errors', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const m = gcLetter('20200101-000000-abcdef');
+  plant(sb, repo, m);
+  plant(sb, repo, gcLetter('20200101-000001-fedcba'));
+  assert.equal(statusJson(sb, repo, 'abcd').id, m.id, 'the hex prefix identifies the live letter');
+
+  ok(sb.bell(repo, ['gc', '--expire-unread', '30d', '--as', 'codex']), 'expire short-id letters');
+  assert.ok(!sb.refs(repo).includes(letterRef(m)), 'lookup must now resolve a tombstone');
+  const status = statusJson(sb, repo, 'abcd');
+  assert.equal(status.id, m.id);
+  const state = recipient(status, 'codex');
+  assert.equal(state.state, 'expired');
+  assert.equal(state.timeline.find((e) => e.state === 'expired').actor, 'codex');
+  const read = sb.bell(repo, ['read', 'abcd', '--as', 'codex']);
+  assert.equal(read.code, 1);
+  assert.match(read.err, new RegExp(`${m.id} was expired by codex`));
+}));
+
+test('gc expiry uses a strict age cutoff for seconds through weeks, including zero; an inclusive-cutoff mutant fails', () => withSandbox((sb) => {
+  const fixed = '2026-01-02T12:00:00.000Z';
+  const source = changedSource('const now = new Date();\n  const cutoff =', `const now = new Date('${fixed}');\n  const cutoff =`);
+  const script = scriptWith(sb, 'fixed-clock', source);
+  const check = (name, age, ms, program = script) => {
+    const repo = sb.repo(name);
+    const cutoff = Date.parse(fixed) - ms;
+    for (const [id, offset] of [['older', -1], ['boundary', 0], ['younger', 1]]) plant(sb, repo, gcLetter(id, { ts: new Date(cutoff + offset).toISOString() }));
+    ok(sb.bell(repo, ['gc', '--expire-unread', age, '--as', 'codex'], { script: program }), 'fixed-clock expiry');
+    assert.deepEqual(sb.refs(repo, 'refs/bell/inbox'), ['refs/bell/inbox/codex/boundary', 'refs/bell/inbox/codex/younger'], 'a letter exactly at the TTL cutoff stays');
+    assert.equal(view(sb, repo, 'older').state, 'expired');
+  };
+  for (const [age, ms] of [['1s', 1000], ['1m', 60000], ['1h', 3600000], ['1d', 86400000], ['1w', 604800000], ['0s', 0]]) check(`cutoff-${age}`, age, ms);
+  const mutant = scriptWith(sb, 'inclusive-cutoff', changedSource('Date.parse(m.ts) < now.getTime() - expiryAge', 'Date.parse(m.ts) <= now.getTime() - expiryAge', source));
+  assert.throws(() => check('cutoff-mutant', '1d', 86400000, mutant), assert.AssertionError, 'negative control catches expiration exactly on the boundary');
+}));
+
+test('gc without flags preserves its exact output and unread mail; enabling expiry by default fails this control', () => withSandbox((sb) => {
+  const check = (name, script = YOGIT) => {
+    const repo = sb.repo(name);
+    const m = gcLetter('default-unread');
+    plant(sb, repo, m);
+    const run = ok(sb.bell(repo, ['gc', '--as', 'codex'], { script }), 'default gc');
+    assert.ok(sb.refs(repo).includes(letterRef(m)), 'unread mail is protected with no flags');
+    assert.equal(run.out, 'yogit: gc deleted 0 messages, folding 0 events and 0 read marks into tombstones; kept 1 unread, 0 read but newer than 30d, 0 archived, 0 broadcasts; packed refs\n');
+    assert.equal(run.err, '');
+  };
+  check('normal');
+  const mutant = scriptWith(sb, 'expiry-on-by-default', changedSource("const expiryAge = parseExpiryAge(opts['expire-unread']);", "const expiryAge = parseExpiryAge(opts['expire-unread'] ?? '0s');"));
+  assert.throws(() => check('mutant', mutant), assert.AssertionError, 'negative control catches accidental default expiry');
+}));
+
+// Observe real git operations without contacting any service. Faults happen at
+// the command boundary: these checks would catch a skipped verification step.
+function tracedGit(sb, { verifyFails = false, mismatch = false } = {}) {
+  const realGit = process.env.PATH.split(delimiter).map((p) => join(p, 'git')).find(existsSync);
+  assert.ok(realGit, 'git executable is on PATH');
+  const bin = join(sb.dir, 'bin');
+  mkdirSync(bin);
+  const log = join(sb.dir, 'git-calls.jsonl');
+  const script = `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { appendFileSync, existsSync, readFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const log = ${JSON.stringify(log)};
+const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse) : [];
+appendFileSync(log, JSON.stringify(args) + '\\n');
+if (${verifyFails} && args.includes('bundle') && args.includes('verify')) {
+  process.stderr.write('injected bundle verify failure\\n'); process.exit(1);
+}
+const r = spawnSync(${JSON.stringify(realGit)}, args, { encoding: 'utf8', input: readFileSync(0) });
+process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
+if (${mismatch} && args[0] === 'ls-remote' && calls.filter((c) => c[0] === 'ls-remote').length === 2) {
+  process.stdout.write('1111111111111111111111111111111111111111\\trefs/bell/inbox/codex/concurrent-letter\\n');
+}
+process.exit(r.status === null ? 1 : r.status);
+`;
+  writeFileSync(join(bin, 'git'), script, { mode: 0o755 });
+  return {
+    env: { PATH: `${bin}${delimiter}${process.env.PATH}` },
+    calls: () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [],
+  };
+}
+
+function remoteGcFixture(sb) {
+  const { bare, a, b } = hubAndClones(sb);
+  const old = gcLetter('remote-old-read');
+  const kept = gcLetter('remote-kept-unread');
+  plant(sb, a, old, { acks: ['codex'] });
+  plant(sb, a, kept);
+  plantEvent(sb, a, { msg: old.id, to: 'codex', state: 'read', ts: '2020-01-02T00:00:00.000Z', actor: 'codex', via: 'local' }, '20200102-000000-read-aaaaaa');
+  ok(sb.bell(a, ['sync', '--as', 'claude']), 'fixture sync');
+  const doomed = refsOf(sb, bare, old.id);
+  assert.equal(doomed.length, 3, 'letter, read event and legacy mark start on the remote');
+  return { bare, a, b, old, kept, doomed };
+}
+
+test('gc --remote plans by default, and --dry-run also preserves local refs and archive paths', () => withSandbox((sb) => {
+  const { bare, a, old, doomed } = remoteGcFixture(sb);
+  const remoteBefore = sb.git(bare, 'for-each-ref', 'refs/bell');
+  const localBefore = sb.git(a, 'for-each-ref', 'refs/bell');
+  const archive = join(sb.dir, 'planned.bundle');
+  const dry = ok(sb.bell(a, ['gc', '--remote', '--apply', '--archive', archive, '--dry-run', '--as', 'codex']), 'remote dry run');
+  assert.match(dry.out, /would delete 3 refs/);
+  assert.equal(sb.git(a, 'for-each-ref', 'refs/bell'), localBefore);
+  assert.equal(sb.git(bare, 'for-each-ref', 'refs/bell'), remoteBefore);
+  assert.equal(existsSync(archive), false);
+  const plan = ok(sb.bell(a, ['gc', '--remote', '--archive', archive, '--as', 'codex']), 'remote plan');
+  assert.match(plan.out, /would delete 3 refs.*plan only.*--apply/);
+  assert.equal(view(sb, a, old.id).state, 'deleted', 'only the remote leg is plan-only');
+  assert.equal(sb.git(bare, 'for-each-ref', 'refs/bell'), remoteBefore);
+  assert.ok(doomed.every((r) => sb.refs(bare).includes(r)));
+  assert.equal(existsSync(archive), false, 'planning does not write an archive');
+}));
+
+for (const archive of [false, true]) test(`gc --remote --apply deletes in one push after tombstone sync${archive ? ', with a verified complete bundle' : ''}`, { skip: process.platform === 'win32' && 'git tracing uses a POSIX executable' }, () => withSandbox((sb) => {
+  const { bare, a, b, old, kept, doomed } = remoteGcFixture(sb);
+  // A clone holding the old letter must not bring it back after remote trim.
+  ok(sb.bell(b, ['sync', '--as', 'claude']), 'stale clone sync');
+  const traced = tracedGit(sb);
+  const bundle = join(sb.dir, 'letters.bundle');
+  const configBefore = readFileSync(join(a, '.git', 'config'), 'utf8');
+  const before = sb.refs(bare).length;
+  const env = { ...traced.env, ...(archive ? { GIT_COMMON_DIR: join(a, '.git') } : {}) };
+  const run = ok(sb.bell(a, ['gc', '--remote', '--apply', ...(archive ? ['--archive', bundle] : []), '--as', 'codex'], { env }), 'remote apply');
+  assert.match(run.out, /remote deleted 3 refs/);
+  assert.equal(sb.refs(bare).length, before + 1 - doomed.length, 'the baseline accounts for the newly synced tombstone');
+  assert.ok(doomed.every((r) => !sb.refs(bare).includes(r)));
+  assert.ok(sb.refs(bare).includes(letterRef(kept)));
+  assert.equal(sb.refs(bare, 'refs/bell/tomb').length, 1);
+  const calls = traced.calls();
+  const deletion = calls.filter((c) => c[0] === 'push' && c.some((arg) => arg.startsWith(':refs/bell/')));
+  assert.equal(deletion.length, 1, 'every deletion is in one push');
+  assert.deepEqual(deletion[0].filter((arg) => arg.startsWith(':')).map((arg) => arg.slice(1)).sort(), doomed);
+  const deleteAt = calls.indexOf(deletion[0]);
+  assert.ok(calls.slice(0, deleteAt).some((c) => c[0] === 'push' && c.some((arg) => arg.includes('refs/bell/tomb/'))), 'tombstones are pushed before deletion');
+  assert.ok(calls.slice(deleteAt + 1).some((c) => c[0] === 'ls-remote'), 'remote refs are read back after deletion');
+  if (archive) {
+    assert.equal(readFileSync(join(a, '.git', 'config'), 'utf8'), configBefore, 'the temporary archive repo cannot reconfigure the source common directory');
+    assert.equal(sb.git(a, 'config', '--get', 'core.bare'), 'false');
+    assert.deepEqual(sb.refs(a), [letterRef(kept), ...sb.refs(a, 'refs/bell/tomb')].sort(), 'archive staging never recreates deleted source refs');
+    sb.git(a, 'bundle', 'verify', bundle);
+    const bundled = sb.git(a, 'bundle', 'list-heads', bundle).split('\n').map((l) => l.split(' ')[1]).sort();
+    assert.deepEqual(bundled, doomed, 'the archive keeps every original ref name, including event and read mark');
+    assert.ok(calls.slice(0, deleteAt).some((c) => c.includes('bundle') && c.includes('verify')), 'bundle verification precedes deletion');
+    const restored = sb.repo('restore');
+    sb.git(restored, 'fetch', bundle, ...doomed.map((r) => `${r}:${r}`));
+    assert.deepEqual(sb.refs(restored), doomed, 'archived refs can be restored independently');
+    assert.match(sb.git(restored, 'cat-file', 'commit', letterRef(old)), /SECRET-GC-BODY/);
+  }
+  ok(sb.bell(b, ['sync', '--as', 'claude']), 'stale clone after purge');
+  assert.equal(view(sb, b, old.id).state, 'deleted');
+  assert.ok(!sb.refs(bare).includes(letterRef(old)), 'a stale clone does not re-export retired letters');
+  const fresh = freshClone(sb, bare, 'fresh-after-purge', 'codex');
+  assert.equal(view(sb, fresh, old.id).state, 'deleted');
+  assert.ok(!sb.refs(fresh).includes(letterRef(old)), 'a fresh clone learns only the tombstone');
+}));
+
+test('gc --remote refuses an existing archive and missing archive values before changing refs', () => withSandbox((sb) => {
+  const { bare, a } = remoteGcFixture(sb);
+  const path = join(sb.dir, 'keep.bundle');
+  writeFileSync(path, 'keep this file');
+  const localBefore = sb.git(a, 'for-each-ref', 'refs/bell');
+  const remoteBefore = sb.git(bare, 'for-each-ref', 'refs/bell');
+  for (const flags of [['--archive', path], ['--archive'], ['--archive', '--apply'], ['--archive=']]) {
+    const r = sb.bell(a, ['gc', '--remote', '--apply', '--as', 'codex', ...flags]);
+    assert.notEqual(r.code, 0, flags.join(' '));
+    assert.equal(sb.git(a, 'for-each-ref', 'refs/bell'), localBefore);
+    assert.equal(sb.git(bare, 'for-each-ref', 'refs/bell'), remoteBefore);
+    assert.equal(readFileSync(path, 'utf8'), 'keep this file');
+  }
+}));
+
+test('gc --remote refuses an unavailable archive directory with zero remote deletions', () => withSandbox((sb) => {
+  const { bare, a, doomed } = remoteGcFixture(sb);
+  const before = sb.git(bare, 'for-each-ref', 'refs/bell');
+  const bundle = join(sb.dir, 'unavailable-directory', 'archive.bundle');
+  const run = sb.bell(a, ['gc', '--remote', '--apply', '--archive', bundle, '--as', 'codex']);
+  assert.notEqual(run.code, 0, 'the archive must be writable before remote deletion');
+  assert.equal(sb.git(bare, 'for-each-ref', 'refs/bell'), before, 'all remote refs and their objects are unchanged');
+  assert.ok(doomed.every((r) => sb.refs(bare).includes(r)));
+  assert.equal(existsSync(bundle), false);
+}));
+
+test('gc --remote bundle verification failure prevents all deletions; skipping verify fails this control', { skip: process.platform === 'win32' && 'git tracing uses a POSIX executable' }, async () => {
+  for (const mutant of [false, true]) await withSandbox((sb) => {
+    const { bare, a, doomed } = remoteGcFixture(sb);
+    const traced = tracedGit(sb, { verifyFails: true });
+    const script = mutant ? scriptWith(sb, 'skip-bundle-verify', changedSource("    git(['bundle', 'verify', bundle]);", '    // Verification deliberately omitted by this negative control.')) : YOGIT;
+    const r = sb.bell(a, ['gc', '--remote', '--apply', '--archive', join(sb.dir, 'archive.bundle'), '--as', 'codex'], { env: traced.env, script });
+    const check = () => {
+      assert.notEqual(r.code, 0, 'verification failure must be fatal');
+      assert.match(r.err, /bundle.*verify|verify.*failure/);
+      assert.ok(doomed.every((ref) => sb.refs(bare).includes(ref)), 'zero planned refs were deleted');
+      assert.equal(traced.calls().filter((c) => c[0] === 'push' && c.some((arg) => arg.startsWith(':refs/bell/'))).length, 0, 'no deletion push was attempted');
+    };
+    if (mutant) assert.throws(check, assert.AssertionError, 'negative control catches a skipped bundle verification');
+    else check();
+  });
+});
+
+test('gc --remote fails a count-mismatch readback; ignoring the count fails this control', { skip: process.platform === 'win32' && 'git tracing uses a POSIX executable' }, async () => {
+  for (const mutant of [false, true]) await withSandbox((sb) => {
+    const { bare, a, doomed } = remoteGcFixture(sb);
+    const traced = tracedGit(sb, { mismatch: true });
+    const script = mutant ? scriptWith(sb, 'ignore-remote-count', changedSource('if (before.size - after.size !== removing.size || [...removing.keys()].some((ref) => after.has(ref))) {', 'if (false) {')) : YOGIT;
+    const r = sb.bell(a, ['gc', '--remote', '--apply', '--as', 'codex'], { env: traced.env, script });
+    assert.ok(doomed.every((ref) => !sb.refs(bare).includes(ref)), 'the injected mismatch occurs after the deletion');
+    const check = () => {
+      assert.notEqual(r.code, 0, 'a remote count mismatch must be fatal');
+      assert.match(r.err, /count mismatch/);
+      assert.doesNotMatch(r.out, /verified remote count/);
+    };
+    if (mutant) assert.throws(check, assert.AssertionError, 'negative control catches an ignored readback mismatch');
+    else check();
+  });
+});
+
+test('sync auto gc is off by default, uses a strict ref threshold, and leaves remote and unread mail alone', () => withSandbox((sb) => {
+  const { bare, a, old, kept } = remoteGcFixture(sb);
+  sb.git(a, 'config', 'bell.gc.autoRefs', '1');
+  const ordinary = ok(sb.bell(a, ['sync', '--as', 'claude']), 'default sync');
+  assert.doesNotMatch(ordinary.out, /gc/);
+  assert.ok(sb.refs(a).includes(letterRef(old)), 'a threshold alone does not enable gc');
+  sb.git(a, 'config', 'bell.gc.auto', 'true');
+  sb.git(a, 'config', '--unset', 'bell.gc.autoRefs');
+  assert.doesNotMatch(ok(sb.bell(a, ['sync', '--as', 'claude']), 'default threshold').out, /gc/);
+  const count = sb.refs(a).length;
+  sb.git(a, 'config', 'bell.gc.autoRefs', String(count));
+  assert.doesNotMatch(ok(sb.bell(a, ['sync', '--as', 'claude']), 'at threshold').out, /gc/);
+  assert.ok(sb.refs(a).includes(letterRef(old)), 'exactly at the threshold does nothing');
+  sb.git(a, 'config', 'bell.gc.autoRefs', String(count - 1));
+  const auto = ok(sb.bell(a, ['sync', '--as', 'claude']), 'past threshold');
+  assert.match(auto.out, /gc deleted 1 message/);
+  assert.equal(view(sb, a, old.id).state, 'deleted');
+  assert.ok(sb.refs(a).includes(letterRef(kept)), 'auto gc never enables unread expiry');
+  assert.ok(sb.refs(bare).includes(letterRef(old)), 'auto local gc never implies remote deletion');
+}));
+
+test('sync auto remote gc requires both switches and honors the sync remote', () => withSandbox((sb) => {
+  const { bare, a, old } = remoteGcFixture(sb);
+  sb.git(a, 'remote', 'rename', 'origin', 'mail');
+  sb.git(a, 'config', 'bell.gc.autoRefs', '1');
+  sb.git(a, 'config', 'bell.gc.autoRemote', 'true');
+  assert.doesNotMatch(ok(sb.bell(a, ['sync', 'mail', '--as', 'claude']), 'auto remote alone').out, /gc/);
+  assert.ok(sb.refs(bare).includes(letterRef(old)));
+  sb.git(a, 'config', 'bell.gc.auto', 'true');
+  const auto = ok(sb.bell(a, ['sync', 'mail', '--as', 'claude']), 'auto remote');
+  assert.match(auto.out, /remote deleted 3 refs on mail/);
+  assert.ok(!sb.refs(bare).includes(letterRef(old)));
+  assert.equal(sb.refs(bare, 'refs/bell/tomb').length, 1);
+}));
+
+test('sync auto gc uses the named worktree identity and protects another identity\'s read mail', () => withSandbox((sb) => {
+  const { bare, a } = hubAndClones(sb);
+  sb.git(a, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '--allow-empty', '-m', 'init');
+  ok(sb.bell(a, ['name', 'claude']), 'name main worktree');
+  const worktree = join(sb.dir, 'worker');
+  sb.git(a, 'worktree', 'add', '-q', worktree);
+  ok(sb.bell(worktree, ['name', 'reviewer']), 'name linked worktree');
+  const own = gcLetter('named-worktree-own', { from: 'alice', to: 'reviewer' });
+  const other = gcLetter('named-worktree-other', { from: 'alice', to: 'claude' });
+  for (const m of [own, other]) plant(sb, a, m, { acks: [m.to] });
+  const otherBefore = refsOf(sb, a, other.id);
+  sb.git(a, 'config', 'bell.gc.auto', 'true');
+  sb.git(a, 'config', 'bell.gc.autoRefs', '1');
+
+  const auto = ok(sb.bell(worktree, ['sync'], { env: { CLAUDECODE: '1' } }), 'named worktree auto gc');
+  assert.match(auto.out, /auto gc:/);
+  assert.match(auto.out, /gc deleted 1 message/);
+  assert.ok(!sb.refs(a).includes(letterRef(own)), 'the linked worktree retires its own mail');
+  const state = view(sb, a, own.id, 'reviewer');
+  assert.equal(state.state, 'deleted');
+  assert.equal(state.timeline.find((e) => e.state === 'deleted').actor, 'reviewer', 'the worktree name outranks agent detection');
+  assert.deepEqual(refsOf(sb, a, other.id), otherBefore, 'mail belonging to the main worktree identity is untouched');
+  assert.equal(view(sb, a, other.id, 'claude').state, 'acked');
+  assert.match(ok(sb.bell(a, ['name']), 'main worktree identity').out, /you are claude \(git config --worktree bell\.name\)/);
+  assert.ok(sb.refs(bare).includes(letterRef(own)), 'local auto gc still leaves remote mail intact');
+}));
+
+test('gc expiry and remote trim share the expired state with stale and fresh clones', () => withSandbox((sb) => {
+  const { bare, a, b } = hubAndClones(sb);
+  const m = gcLetter('expired-across-clones');
+  plant(sb, a, m);
+  ok(sb.bell(a, ['sync', '--as', 'claude']), 'send old unread');
+  ok(sb.bell(b, ['sync', '--as', 'claude']), 'stale sender clone');
+  ok(sb.bell(a, ['gc', '--expire-unread', '30d', '--remote', '--apply', '--as', 'codex']), 'expire and trim');
+  assert.ok(!sb.refs(bare).includes(letterRef(m)));
+  ok(sb.bell(b, ['sync', '--as', 'claude']), 'receive expiry');
+  assert.equal(view(sb, b, m.id).state, 'expired');
+  assert.match(sb.bell(b, ['outbox', '--all', '--as', 'claude']).out, /expired-across-clones.*expired/);
+  assert.ok(!sb.refs(bare).includes(letterRef(m)), 'the stale letter never returns to the remote');
+  const fresh = freshClone(sb, bare, 'fresh-expired', 'codex');
+  assert.equal(view(sb, fresh, m.id).state, 'expired');
+  assert.ok(!sb.refs(fresh).includes(letterRef(m)));
+}));
+
+test('gc refuses a tombstone merge beyond the reader limit without deleting source refs; bypassing the guard fails', () => withSandbox((sb) => {
+  const check = (name, script = YOGIT) => {
+    const repo = sb.repo(name);
+    const m = gcLetter('oversized-trail');
+    for (const suffix of ['a', 'b']) {
+      const trail = Array.from({ length: 5000 }, (_, i) => ({
+        id: `entry-${suffix}-${i}`, to: m.to, state: i === 0 ? 'deleted' : 'read',
+        ts: m.ts, actor: m.to, via: 'gc',
+      }));
+      const tomb = { v: 1, kind: 'tomb', msg: m.id, to: m.to, from: m.from, sent: m.ts, trail };
+      const commit = `tree ${EMPTY_TREE}\nauthor codex <codex@bell> 1577836800 +0000\ncommitter bell <bell@bell> 1577836800 +0000\n\n${JSON.stringify(tomb)}\n`;
+      assert.ok(Buffer.byteLength(commit) < 1024 * 1024, 'each source tombstone fits the reader limit');
+      assert.ok(Buffer.byteLength(commit) > 512 * 1024, 'merging both would exceed that limit');
+      const oid = sb.gitWith(repo, ['hash-object', '-t', 'commit', '-w', '--stdin'], { input: commit });
+      sb.git(repo, 'update-ref', `refs/bell/tomb/${m.to}/${m.id}/20200101-000000-tomb-${suffix.repeat(6)}`, oid);
+    }
+    plantEvent(sb, repo, { msg: m.id, to: m.to, state: 'delivered', ts: m.ts, actor: m.to, via: 'sync' }, '20200101-000000-delivered-aaaaaa');
+    assert.equal(view(sb, repo, m.id).state, 'deleted', 'both source tombstones are readable');
+    const before = sb.git(repo, 'for-each-ref', 'refs/bell');
+    const r = sb.bell(repo, ['gc', '--older-than', '0d', '--as', 'codex'], { script });
+    assert.notEqual(r.code, 0, 'an unreadable replacement must refuse the merge');
+    assert.match(r.err, /1 MiB.*source refs kept/);
+    assert.equal(sb.git(repo, 'for-each-ref', 'refs/bell'), before, 'the source tombstones and fresh event remain intact');
+  };
+  check('bounded');
+  const mutant = scriptWith(sb, 'skip-tombstone-check', changedSource('if (!parsed || parsed.trail.length !== tomb.trail.length) {', 'if (false) {'));
+  assert.throws(() => check('unbounded-mutant', mutant), assert.AssertionError, 'negative control catches a tombstone the next read cannot parse');
 }));
