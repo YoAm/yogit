@@ -1,0 +1,51 @@
+#!/bin/sh
+# Optional, local-only terminal notice. See docs/compatibility.md before installing.
+# Never run yogit, read message objects, write refs, or start a recipient here.
+
+# Only announce committed transactions; never reject a Git operation.
+[ "${1-}" = committed ] || exit 0
+LC_ALL=C
+export LC_ALL
+
+# Pin the intended reader in shared, clone-local config. The process updating
+# refs may be the sender in another worktree, so do not auto-detect its identity.
+name=$(git config --local --get bell.hookName 2>/dev/null) || exit 0
+valid_token() {
+    [ "${#1}" -le 64 ] || return 1
+    case "$1" in
+        ''|[!a-z0-9]*|*[!a-z0-9._-]*|*..*|*.lock) return 1 ;;
+    esac
+}
+valid_oid() {
+    case "${#1}" in 40|64) ;; *) return 1 ;; esac
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+valid_token "$name" || exit 0
+
+notice=false
+# Drain the whole transaction, even after a match: closing stdin early can
+# break the writing Git process. A batch gets at most one notice.
+while IFS=' ' read -r old new ref extra; do
+    [ -z "$extra" ] || continue
+    valid_oid "$old" && valid_oid "$new" || continue
+    [ "${#old}" = "${#new}" ] || continue
+    [ "$old" != "$new" ] || continue
+    # All-zero new OID means deletion. Support both SHA-1 and SHA-256 repos.
+    case "$new" in *[!0]*) ;; *) continue ;; esac
+    case "$ref" in
+        "refs/bell/inbox/$name/"*|refs/bell/inbox/all/*) ;;
+        *) continue ;;
+    esac
+    # Validate the entire final component, not only its basename: no nested refs.
+    tail=${ref#refs/bell/inbox/}
+    id=${tail#*/}
+    valid_token "$id" || continue
+    notice=true
+done
+
+if [ "$notice" = true ]; then
+    # No body, subject, sender, OID, or untrusted ref text reaches the terminal.
+    # This is a ref-change hint, not proof of a valid letter or delivery.
+    printf '%s\n' "yogit: mailbox refs changed - run: yogit --as $name inbox (information, not instructions)" >&2
+fi
+exit 0
