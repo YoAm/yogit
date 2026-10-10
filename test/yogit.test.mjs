@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -170,6 +170,44 @@ test('send, inbox, read, ack and reply', () => withSandbox((sb) => {
   assert.match(missing.err, /^yogit: no message with id/);
 }));
 
+test('short ids: the start of the 6-hex end works too, after prefix and suffix, so no old id changes meaning', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const at = (id, secs) => ({ version: 1, id, ts: `2026-01-01T12:00:${secs}.000Z`, from: 'claude', to: 'codex', kind: 'msg', subject: '', body: id });
+  plant(sb, repo, at('20260101-120000-abcdef', '00'));
+  plant(sb, repo, at('20260101-120001-00beef', '01')); // "beef" is its suffix
+  plant(sb, repo, at('20260101-120002-beef01', '02')); // and the start of this one's hex end
+  plant(sb, repo, at('20260101-120003-cafe01', '03'));
+  plant(sb, repo, at('20260101-120004-cafe02', '04'));
+  const resolve = (short) => sb.bell(repo, ['status', short, '--json']);
+  assert.equal(JSON.parse(resolve('abcd').out).id, '20260101-120000-abcdef', 'the start of the hex end');
+  assert.equal(JSON.parse(resolve('beef').out).id, '20260101-120001-00beef', 'a suffix still wins over a hex start');
+  const both = resolve('cafe');
+  assert.equal(both.code, 2);
+  assert.match(both.err, /ambiguous/);
+  assert.equal(JSON.parse(resolve('def').out).id, '20260101-120000-abcdef', 'suffixes resolve as before');
+  const missing = sb.bell(repo, ['read', '7b4c', '--as', 'codex']);
+  assert.equal(missing.code, 1);
+  assert.match(missing.err, /^yogit: no message with id "7b4c"/);
+  assert.match(missing.err, /e\.g\. [0-9a-f]{6}\b/, 'the error shows a real short id to copy');
+}));
+
+test('send notes a name nobody has used yet, and suggests the one you probably meant', () => withSandbox((sb) => {
+  const repo = sb.repo('repo', { commit: true });
+  assert.equal(sb.bell(repo, ['send', 'codex', 'hi', '--as', 'claude']).err, '', 'an agent name needs no introduction, even in an empty mailbox');
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const typo = sb.bell(repo, ['send', 'claud', 'hi', '--as', 'codex']);
+  assert.equal(typo.code, 0, 'the letter is still delivered');
+  assert.match(typo.out, /^yogit: sent \S+ to claud$/m);
+  assert.match(typo.err, /claud is new to this mailbox \(known: claude, codex\) - did you mean claude\?/);
+  assert.equal(sb.bell(repo, ['send', 'claud', 'again', '--as', 'codex']).err, '', 'once used, a name is known');
+  const bob = sb.bell(repo, ['send', 'bob', 'hi', '--as', 'codex']);
+  assert.match(bob.err, /bob is new to this mailbox/);
+  assert.doesNotMatch(bob.err, /did you mean/, 'nothing close enough to suggest');
+  assert.equal(sb.bell(repo, ['name', 'parser-bot']).code, 0);
+  assert.equal(sb.bell(repo, ['send', 'parser-bot', 'hi', '--as', 'codex']).err, '', 'a worktree that named itself is known');
+  assert.equal(sb.bell(repo, ['send', 'all', 'hi', '--as', 'codex']).err, '');
+}));
+
 test('kind: defaults to "msg", --kind sets it, and it is shown', () => withSandbox((sb) => {
   const repo = sb.repo('repo');
   const id = sentId(sb.bell(repo, ['send', 'codex', 'can', 'you', 'look', '--kind', 'ASK', '--as', 'claude']));
@@ -263,6 +301,8 @@ test('identity precedence: --as, BELL_AS, YOGIT_AS, bell.name, agent env, user.n
   assert.equal(none.code, 2);
   assert.match(none.err, /cannot tell who you are/);
   assert.match(none.err, /YOGIT_AS/);
+  assert.match(none.err, /yogit name <name>/, 'the hint names one worktree, not the whole repo');
+  assert.doesNotMatch(none.err, /git config bell\.name/, 'a shared bell.name outranks every agent in every worktree');
 
   sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
   assert.equal(whoSends([], {}), 'ada-lovelace');
@@ -273,13 +313,29 @@ test('identity precedence: --as, BELL_AS, YOGIT_AS, bell.name, agent env, user.n
   assert.equal(whoSends([], agents), 'claude');
   assert.equal(whoSends([], { CLAUDE_CODE_ENTRYPOINT: 'cli' }), 'claude');
 
+  // Only variables an agent sets for the commands it runs count, in a fixed order.
+  assert.equal(whoSends([], { CURSOR_AGENT: '1' }), 'cursor');
+  assert.equal(whoSends([], { CODEX_SANDBOX_NETWORK_DISABLED: '1' }), 'codex');
+  assert.equal(whoSends([], { CODEX_CI: '1' }), 'codex');
+  assert.equal(whoSends([], { GEMINI_CLI: '1' }), 'gemini');
+  assert.equal(whoSends([], { ANTIGRAVITY_AGENT: '1' }), 'agy');
+  assert.equal(whoSends([], { CLAUDECODE: '1', GEMINI_CLI: '1' }), 'claude', 'claude keeps its priority');
+  // CURSOR_TRACE_ID is inherited by anything started in Cursor's terminal, so it counts last.
+  assert.equal(whoSends([], { GEMINI_CLI: '1', CURSOR_TRACE_ID: 'x' }), 'gemini');
+  assert.equal(whoSends([], { ANTIGRAVITY_AGENT: '1', CURSOR_TRACE_ID: 'x' }), 'agy');
+
   // Settings people export in their shell rc are not an agent at work.
-  for (const [key, value] of [['CLAUDE_CODE_USE_BEDROCK', '1'], ['CODEX_HOME', '/x/.codex'], ['CODEX_API_KEY', 'k'], ['CODEX_MANAGED_BY_NPM', '1']]) {
+  const settings = [
+    ['CLAUDE_CODE_USE_BEDROCK', '1'], ['CODEX_HOME', '/x/.codex'], ['CODEX_API_KEY', 'k'], ['CODEX_MANAGED_BY_NPM', '1'],
+    ['CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT', '1'], ['CODEX_OSS_BASE_URL', 'http://localhost:11434'], ['CURSOR_API_KEY', 'k'],
+  ];
+  for (const [key, value] of settings) {
     assert.equal(whoSends([], { [key]: value }), 'ada-lovelace', `${key} alone must not rename a human`);
   }
 
   sb.git(repo, 'config', 'bell.name', 'Zed');
   assert.equal(whoSends([], agents), 'zed', 'git config beats the agent env (and names are lowercased)');
+  assert.equal(whoSends([], { GEMINI_CLI: '1', ANTIGRAVITY_AGENT: '1', CURSOR_AGENT: '1', CODEX_CI: '1' }), 'zed', 'every agent variable');
   assert.equal(whoSends([], { ...agents, YOGIT_AS: 'from-yogit-env' }), 'from-yogit-env', 'YOGIT_AS is accepted too');
   assert.equal(whoSends([], { ...agents, BELL_AS: 'from-env', YOGIT_AS: 'from-yogit-env' }), 'from-env', 'BELL_AS wins over YOGIT_AS');
   assert.equal(whoSends([], { ...agents, GIT_BELL_AS: 'from-old-env' }), 'from-old-env', 'GIT_BELL_AS, from before the rename, still counts');
@@ -380,6 +436,98 @@ test('two worktrees of one repo share the same mailbox', () => withSandbox((sb) 
   assert.match(sb.bell(main, ['inbox', '--as', 'claude']).out, /1 unread for claude/);
 }));
 
+test('yogit name scopes a name to one worktree, even in a repo that has only one so far', () => withSandbox((sb) => {
+  const CLAUDE = { CLAUDECODE: '1' };
+  const shared = (repo) => sb.gitWith(repo, ['config', '--list', '--show-origin']);
+  const scopeOf = (cwd) => spawnSync('git', ['config', '--show-scope', '--get', 'bell.name'], { cwd, env: sb.baseEnv, encoding: 'utf8' }).stdout.trim();
+
+  // Positive control: without the extension, git writes a "worktree" value into the shared config.
+  const control = sb.repo('control');
+  sb.git(control, 'config', '--worktree', 'bell.name', 'leaky');
+  assert.equal(scopeOf(control), 'local\tleaky', 'git config --worktree alone is shared in a one-worktree repo');
+
+  // (1) The leak case: one worktree, then a second one is added later.
+  const a = sb.repo('a', { commit: true });
+  const named = sb.bell(a, ['name', 'solo']);
+  assert.equal(named.code, 0, named.err);
+  assert.match(named.out, /extensions\.worktreeConfig/, 'it says it turned the extension on');
+  assert.match(named.out, /everyone who runs yogit here/, 'and that the name covers agents in this worktree too');
+  // (2) The name is in this worktree's own config, not the shared one.
+  assert.equal(scopeOf(a), 'worktree\tsolo');
+  assert.equal(spawnSync('git', ['config', '--file', join(a, '.git', 'config'), '--get', 'bell.name'], { env: sb.baseEnv }).status, 1);
+  const b = join(sb.dir, 'b');
+  sb.git(a, 'worktree', 'add', '-q', b);
+  // git (2.36 and later) copies the source worktree's config.worktree into a new worktree, so b
+  // starts as a copy of a's name. yogit wrote nothing there, and says so when it names a worktree.
+  assert.match(sb.bell(b, ['who'], { env: CLAUDE }).out, /you are solo \(git config --worktree bell\.name\)/, 'a worktree added FROM a named one starts with a copy');
+  assert.match(named.out, /git worktree add run from here/, 'yogit name warns about that copy');
+  assert.match(sb.bell(b, ['name', '--unset'], { env: CLAUDE }).out, /you are claude \(detected: CLAUDECODE\)/, '--unset in the copy brings detection back');
+  const c = join(sb.dir, 'c');
+  sb.git(b, 'worktree', 'add', '-q', c);
+  assert.match(sb.bell(c, ['who'], { env: CLAUDE }).out, /you are claude \(detected: CLAUDECODE\)/, 'a worktree added from an unnamed one inherits nothing: the shared config holds no name');
+  assert.doesNotMatch(sb.bell(a, ['name', 'solo-2']).out, /extensions\.worktreeConfig/, 'the extension is only turned on once');
+
+  // (3) Two worktrees, two Claudes.
+  assert.equal(sb.bell(a, ['name', 'claude-parser']).code, 0);
+  sentId(sb.bell(a, ['send', 'codex', 'from a'], { env: CLAUDE }));
+  sentId(sb.bell(b, ['send', 'codex', 'from b'], { env: CLAUDE }));
+  assert.deepEqual(inboxJson(sb, a, 'codex').messages.map((m) => m.from).sort(), ['claude', 'claude-parser']);
+  // (4) No argument: the name, and where it comes from.
+  assert.match(sb.bell(a, ['name']).out, /you are claude-parser \(git config --worktree bell\.name\)/);
+  // (5) --unset brings detection back; a second --unset is a no-op.
+  const unset = sb.bell(a, ['name', '--unset'], { env: CLAUDE });
+  assert.equal(unset.code, 0, unset.err);
+  assert.match(unset.out, /you are claude \(detected: CLAUDECODE\)/);
+  assert.equal(sb.bell(a, ['name', '--unset']).code, 0, 'nothing to unset is not an error');
+  assert.match(sb.bell(a, ['name', '--unset']).out, /no name of its own/);
+  // (6) A bad name changes nothing.
+  const before = shared(a);
+  assert.equal(sb.bell(a, ['name', '../x']).code, 2);
+  assert.equal(shared(a), before);
+
+  // A repo that already followed the old advice: a shared bell.name.
+  const old = sb.repo('old', { commit: true });
+  const oldB = join(sb.dir, 'old-b');
+  sb.git(old, 'worktree', 'add', '-q', oldB);
+  sb.git(old, 'config', 'bell.name', 'dana');
+  const fix = sb.bell(old, ['name', 'solo']);
+  assert.equal(fix.code, 0, fix.err);
+  assert.match(fix.out, /git config --local bell\.name dana still names every other worktree/);
+  assert.match(fix.out, /git config --local --unset bell\.name/);
+  assert.match(sb.bell(oldB, ['name']).out, /you are dana \(git config --local bell\.name\)/, 'the other worktree is unchanged');
+  const back = sb.bell(old, ['name', '--unset']);
+  assert.match(back.out, /you are dana \(git config --local bell\.name\)/, '--unset says which name applies now');
+  assert.equal(sb.bell(old, ['name', '--unset']).code, 0);
+
+  // (7) core.worktree in the shared config has to move before the extension goes on: refused, unchanged.
+  const moved = sb.repo('moved', { commit: true });
+  sb.git(moved, 'config', 'core.worktree', moved);
+  sb.git(moved, 'config', 'bell.name', 'dana');
+  const pinned = shared(moved);
+  const refused = sb.bell(moved, ['name', 'solo']);
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /core\.worktree/);
+  assert.match(refused.err, /config\.worktree core\.worktree/, 'with the git commands that move it');
+  assert.equal(shared(moved), pinned);
+  const bare = join(sb.dir, 'bare.git');
+  sb.git(sb.dir, 'init', '-q', '--bare', bare);
+  assert.equal(sb.bell(bare, ['name', 'solo']).code, 1, 'a bare repo has no worktree to name');
+}));
+
+test('who says where your name comes from, and lists names given to other worktrees', () => withSandbox((sb) => {
+  const a = sb.repo('a', { commit: true });
+  const b = join(sb.dir, 'b');
+  sb.git(a, 'worktree', 'add', '-q', b);
+  assert.match(sb.bell(a, ['who']).out, /you have no name here yet - yogit name <name>/);
+  assert.match(sb.bell(a, ['who'], { env: { CLAUDECODE: '1' } }).out, /you are claude \(detected: CLAUDECODE\)/);
+  assert.match(sb.bell(a, ['who', '--as', 'x']).out, /you are x \(--as\)/);
+  assert.match(sb.bell(a, ['who'], { env: { YOGIT_AS: 'y' } }).out, /you are y \(YOGIT_AS\)/);
+  assert.equal(sb.bell(b, ['name', 'claude-parser']).code, 0);
+  const who = sb.bell(a, ['who'], { env: { CODEX_THREAD_ID: 't' } });
+  assert.match(who.out, /claude-parser .*sent 0, received 0/, 'a peer can find a name before it has sent anything');
+  assert.match(who.out, /you are codex \(detected: CODEX_THREAD_ID\)/);
+}));
+
 test('sync between two clones through a bare remote', () => withSandbox((sb) => {
   const { bare, a, b } = hubAndClones(sb);
 
@@ -414,6 +562,24 @@ test('sync between two clones through a bare remote', () => withSandbox((sb) => 
   const broken = sb.bell(lonely, ['sync', '--as', 'alice']);
   assert.equal(broken.code, 1);
   assert.match(broken.err, /does not appear to be a git repository/);
+}));
+
+test('a fresh clone says its mail arrives with yogit sync, until it does', () => withSandbox((sb) => {
+  const { bare, a, b } = hubAndClones(sb);
+  sentId(sb.bell(a, ['send', 'bob', 'hello', '--as', 'alice']));
+  assert.equal(sb.bell(a, ['sync', '--as', 'alice']).code, 0);
+  sb.git(sb.dir, 'clone', '-q', bare, 'c');
+  const c = join(sb.dir, 'c');
+  const HINT = /no mail in this clone yet; mail on origin arrives with: yogit sync/;
+  assert.match(sb.bell(b, ['inbox', '--as', 'bob']).out, HINT);
+  assert.match(sb.bell(b, ['who', '--as', 'bob']).out, HINT);
+  assert.deepEqual(sb.bell(c, ['ring', '--as', 'bob']), { code: 0, out: '', err: '' }, 'ring stays silent: it is for hooks');
+  const json = sb.bell(b, ['inbox', '--json', '--as', 'bob']).out;
+  assert.equal(sb.bell(b, ['sync', '--as', 'bob']).code, 0);
+  assert.doesNotMatch(sb.bell(b, ['inbox', '--as', 'bob', '--all']).out, /yogit sync/, 'gone once mail is here');
+  const lonely = sb.repo('lonely');
+  assert.doesNotMatch(sb.bell(lonely, ['inbox', '--as', 'bob']).out, /yogit sync/, 'no remote, no hint');
+  assert.equal(sb.bell(lonely, ['inbox', '--json', '--as', 'bob']).out, json, 'inbox --json is the same with and without a remote');
 }));
 
 test('sync never deletes unsynced mail, even when fetch prunes', () => withSandbox((sb) => {
@@ -491,6 +657,17 @@ test('ring is silent with no mail, and outside a repo', () => withSandbox((sb) =
   const inbox = sb.bell(outside, ['inbox', '--as', 'claude']);
   assert.equal(inbox.code, 1);
   assert.match(inbox.err, /^yogit: not inside a git repository/);
+}));
+
+test('ring never fails a hook over a missing name, but a bad explicit name is still loud', () => withSandbox((sb) => {
+  const repo = sb.repo('repo'); // no user.name, and the sandbox passes no agent variables
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const ring = sb.bell(repo, ['ring']);
+  assert.equal(ring.code, 0, 'a SessionStart hook that exits non-zero shows an error every session');
+  assert.equal(ring.out, '');
+  assert.match(ring.err, /^yogit: ring: no name here yet \(run: yogit doctor\)\n$/);
+  assert.equal(sb.bell(repo, ['ring'], { env: { BELL_AS: '../x' } }).code, 2, 'a name the user set, and set wrong, is a configuration error');
+  assert.equal(sb.bell(repo, ['inbox']).code, 2, 'other commands still refuse to guess');
 }));
 
 test('a malformed message warns only its reader, and never through ring', () => withSandbox((sb) => {
@@ -991,6 +1168,7 @@ test('watch prints one framed line per new message', async () => {
       }
     };
     await until(() => /watching mail for codex/.test(err), 'watch to start');
+    assert.match(err, /watching mail for codex every 0\.2s \(1 unread already - yogit inbox/, 'it says what is already waiting');
     sentId(sb.bell(repo, ['send', 'someone-else', 'not for codex', '--as', 'claude']));
     const id = sentId(sb.bell(repo, ['send', 'codex', 'fresh', '--subject', 'ping', '--as', 'claude']));
     await until(() => out.includes(id), 'the new message');
@@ -1029,23 +1207,566 @@ test('hooks print snippets and never write files', () => withSandbox((sb) => {
   assert.match(cursor.err, /\.cursor\/rules\/yogit\.mdc/);
   assert.equal(sb.bell(empty, ['hooks', 'vim']).code, 2);
   assert.deepEqual(readdirSync(empty), [], 'no files written');
+
+  // What agents read must not tell them their name, or re-teach the shared bell.name.
+  for (const agent of ['claude', 'codex', 'cursor']) {
+    const h = sb.bell(empty, ['hooks', agent]);
+    for (const bad of ['git config bell.name', 'BELL_AS', 'Your name is', 'command -v yogit']) {
+      assert.ok(!(h.out + h.err).includes(bad), `hooks ${agent} says ${JSON.stringify(bad)}`);
+    }
+  }
+  assert.match(sb.bell(empty, ['hooks', 'codex']).out, /yogit who/);
+}));
+
+// A directory holding only the named programs (as symlinks), for a PATH with nothing else on it.
+function onlyOnPath(sb, name, programs) {
+  const bin = join(sb.dir, name);
+  mkdirSync(bin);
+  for (const program of programs) {
+    const found = spawnSync('sh', ['-c', `command -v ${program}`], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(found.startsWith('/'), `${program} on the test host's PATH`);
+    symlinkSync(found, join(bin, program));
+  }
+  return bin;
+}
+const HOOK_LINE = /^#   (if test -x .+ fi)$/m;
+
+test('the hook command yogit suggests names node and yogit by path, and fails soft when either is gone', { skip: process.platform === 'win32' && 'POSIX sh only' }, () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const bare = onlyOnPath(sb, 'bare', ['sh', 'git', 'env']); // no node: the nvm or GUI-app case
+  const sh = (command, env = {}) => spawnSync('/bin/sh', ['-c', command], { cwd: repo, env: { ...sb.baseEnv, PATH: bare, CLAUDECODE: '1', ...env }, encoding: 'utf8' });
+  const RING = 'yogit: 1 unread for claude (from codex) - run: yogit inbox\n';
+
+  // Positive control: this PATH really lacks node, so yogit's own #!/usr/bin/env node line fails.
+  assert.equal(sh(YOGIT + ' ring').status, 127, 'a bare path to yogit.mjs cannot run without node on PATH');
+
+  const hooks = sb.bell(repo, ['hooks', 'claude']);
+  assert.equal(JSON.parse(hooks.out).hooks.SessionStart[0].hooks[0].command, 'yogit ring', 'stdout stays the portable snippet');
+  assert.match(hooks.err, /yogit init claude/);
+  const command = HOOK_LINE.exec(hooks.err)?.[1];
+  assert.ok(command, `a runnable command on stderr: ${hooks.err}`);
+  const ran = sh(command);
+  assert.equal(ran.status, 0, ran.stderr);
+  assert.equal(ran.stdout, RING);
+
+  // Paths with a space and a quote survive the quoting.
+  const odd = join(sb.dir, "it's a dir");
+  mkdirSync(odd);
+  writeFileSync(join(odd, 'yogit.mjs'), SOURCE);
+  const oddCommand = HOOK_LINE.exec(sb.bell(repo, ['hooks', 'claude'], { script: join(odd, 'yogit.mjs') }).err)?.[1];
+  assert.ok(oddCommand.includes("it'\\''s a dir"), oddCommand);
+  assert.equal(sh(oddCommand).stdout, RING);
+
+  // The node on PATH is named when it is this very node (a Homebrew or distro symlink survives
+  // upgrades that delete the versioned path it points at); gone, the hook exits 0 with a hint.
+  const linked = join(sb.dir, 'linked');
+  mkdirSync(linked);
+  symlinkSync(process.execPath, join(linked, 'node'));
+  const viaLink = HOOK_LINE.exec(sb.bell(repo, ['hooks', 'claude'], { env: { PATH: `${linked}:${process.env.PATH}` } }).err)?.[1];
+  assert.ok(viaLink.includes(join(linked, 'node')), viaLink);
+  assert.equal(sh(viaLink).stdout, RING);
+  rmSync(join(linked, 'node'));
+  const stale = sh(viaLink);
+  assert.equal(stale.status, 0, 'a stale hook must not show an error at every session start');
+  assert.equal(stale.stdout, '');
+  assert.match(stale.stderr, /yogit init/);
 }));
 
 test('package, --version and --help name yogit', () => withSandbox((sb) => {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.name, 'yogit');
+  assert.equal(pkg.name, '@yoam/yogit', 'npm refused the unscoped name; the commands stay yogit and git yogit');
+  assert.equal(pkg.publishConfig?.access, 'public', 'a scoped package publishes as restricted unless told otherwise');
   assert.deepEqual(pkg.bin, { yogit: 'yogit.mjs', 'git-yogit': 'yogit.mjs' }, 'yogit, and git-yogit so that git yogit works too; no plain "bell" bin: that name is taken');
-  assert.equal(sb.bell(sb.dir, ['--version']).out.trim(), `yogit ${pkg.version}`);
+  assert.ok(pkg.files.includes('yogit.mjs'));
+  assert.equal(sb.bell(sb.dir, ['--version']).out.trim(), `yogit ${pkg.version}`, 'package.json and VERSION move together');
+  assert.ok(!readFileSync(join(ROOT, 'README.md'), 'utf8').includes('2.2 will stop'), 'the 2.0 read mark outlives 2.2: a later release retires it');
   assert.ok(pkg.engines.node);
   assert.ok(SOURCE.startsWith('#!/usr/bin/env node\n'));
   const help = sb.bell(sb.dir, ['--help']);
   assert.equal(help.code, 0);
   assert.match(help.out, /^yogit /);
   assert.match(help.out, /usage: yogit <command>/);
-  for (const cmd of ['send', 'inbox', 'read', 'reply', 'ack', 'archive', 'unarchive', 'delete', 'status', 'outbox', 'ring', 'watch', 'sync', 'who', 'gc', 'verify', 'import-h5i', 'hooks', 'ring-setup', 'about']) {
+  for (const cmd of ['init', 'send', 'inbox', 'read', 'reply', 'ack', 'archive', 'unarchive', 'delete', 'status', 'outbox', 'ring', 'watch', 'sync', 'who', 'name', 'gc', 'verify', 'import-h5i', 'doctor', 'hooks', 'ring-setup', 'version', 'about']) {
     assert.match(help.out, new RegExp(`^  ${cmd}\\b`, 'm'));
   }
   assert.equal(sb.bell(sb.dir, ['help']).out, help.out);
+}));
+
+test('bare yogit says who you are and what is waiting, and mistakes get the command you meant', () => withSandbox((sb) => {
+  const outside = join(sb.dir, 'outside');
+  mkdirSync(outside);
+  const intro = sb.bell(outside, []);
+  assert.equal(intro.code, 0);
+  assert.match(intro.out, /cd into a repo, then: yogit init/);
+  assert.match(intro.out, /yogit help/);
+
+  const repo = sb.repo('repo');
+  const nameless = sb.bell(repo, []);
+  assert.equal(nameless.code, 0, 'bare yogit always exits 0');
+  assert.match(nameless.out, /yogit name <name>/);
+  const misnamed = sb.bell(repo, [], { env: { BELL_AS: '../x' } });
+  assert.equal(misnamed.code, 0, 'even with a name set wrong');
+  assert.match(misnamed.out, /invalid BELL_AS name[\s\S]*yogit doctor/);
+  const id = sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  const events = () => sb.refs(repo, 'refs/bell/event');
+  const before = events();
+  const status = sb.bell(repo, [], { env: { CLAUDECODE: '1' } });
+  assert.equal(status.code, 0, status.err);
+  assert.match(status.out, /^yogit \S+ - you are claude \(detected: CLAUDECODE\)$/m);
+  assert.match(status.out, /1 unread for claude/);
+  assert.match(status.out, /more: yogit help/);
+  assert.deepEqual(events(), before, 'read-only: it records no delivered event');
+  assert.match(sb.bell(repo, ['--as', 'codex']).out, /you are codex \(--as\)\n.*no unread mail for codex/);
+
+  assert.equal(sb.bell(repo, ['version']).out, sb.bell(repo, ['--version']).out);
+  const option = sb.bell(repo, ['send', 'claude', 'hi', '--sbject', 'x', '--as', 'codex']);
+  assert.equal(option.code, 2);
+  assert.match(option.err, /did you mean --subject\?/);
+  const command = sb.bell(repo, ['inbx']);
+  assert.equal(command.code, 2);
+  assert.match(command.err, /did you mean: yogit inbox\?/);
+
+  // A usage error with no id names your newest letter.
+  const reply = sb.bell(repo, ['reply'], { env: { CLAUDECODE: '1' } });
+  assert.equal(reply.code, 2);
+  assert.ok(reply.err.includes(`yogit reply ${id.slice(-6)} "..."`), reply.err);
+  const ack = sb.bell(repo, ['ack'], { env: { CLAUDECODE: '1' } });
+  assert.equal(ack.code, 2);
+  assert.ok(ack.err.includes(`yogit ack ${id.slice(-6)}`), ack.err);
+  assert.equal(sb.bell(outside, ['reply']).code, 2, 'still a usage error outside a repo');
+}));
+
+// A PATH holding only git, node, sh and env, yogit and git-yogit (this copy), and any
+// stub programs named: init and doctor look at PATH, and the test host's own must not leak in.
+function pinnedPath(sb, stubs = [], name = 'pinned') {
+  const bin = onlyOnPath(sb, name, ['git', 'node', 'sh', 'env']);
+  symlinkSync(YOGIT, join(bin, 'yogit'));
+  symlinkSync(YOGIT, join(bin, 'git-yogit'));
+  for (const stub of stubs) writeFileSync(join(bin, stub), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  return bin;
+}
+
+// Every file under a directory, with its bytes and whether it is a symlink: a snapshot to compare.
+function tree(dir) {
+  const out = {};
+  const walk = (d) => {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, entry.name);
+      if (entry.isSymbolicLink()) out[p] = `-> ${readlinkSync(p)}`;
+      else if (entry.isDirectory()) {
+        out[`${p}/`] = 'dir';
+        walk(p);
+      } else out[p] = readFileSync(p, 'latin1');
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+const doctorLines = (out) => out.split('\n').filter((l) => /^(ok|info|warn|fail) /.test(l));
+
+test('doctor reports ok, info, warn and fail, each with a fix, and changes nothing', () => withSandbox((sb) => {
+  const bin = pinnedPath(sb);
+  const doctor = (cwd, env = {}, args = []) => sb.bell(cwd, ['doctor', ...args], { env: { PATH: bin, ...env } });
+  const repo = sb.repo('repo', { commit: true });
+  sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
+
+  // (a) A clean repo: exit 0, nothing to warn about, and the lines that say why.
+  const clean = doctor(repo);
+  assert.equal(clean.code, 0, clean.out + clean.err);
+  const lines = doctorLines(clean.out);
+  assert.ok(lines.length >= 5, clean.out);
+  assert.deepEqual(lines.filter((l) => /^(warn|fail)/.test(l)), [], clean.out);
+  assert.match(clean.out, /^ok +you are ada-lovelace \(git user\.name\)$/m);
+  assert.match(clean.out, /^ok +yogit on PATH is this copy/m);
+  assert.match(clean.out, /^ok +node \d+\.\d+\.\d+, git \d+\.\d+/m);
+
+  // (h) No name at all is a fail whose fix is yogit name.
+  const nameless = sb.repo('nameless');
+  const none = doctor(nameless);
+  assert.equal(none.code, 1);
+  assert.match(none.out, /^fail .*-> yogit name <name>/m);
+
+  // (b) A refs/bell fetch refspec: a warning, and a fail once prune is on. Both answers, from one check.
+  const { a } = hubAndClones(sb);
+  sb.git(a, 'config', 'user.name', 'Ada Lovelace');
+  sb.git(a, 'config', '--add', 'remote.origin.fetch', '+refs/bell/*:refs/bell/*');
+  const warned = doctor(a);
+  assert.equal(warned.code, 0, warned.out);
+  assert.match(warned.out, /^warn .*refs\/bell.*git fetch -p/m);
+  assert.doesNotMatch(warned.out, /^fail/m);
+  sb.git(a, 'config', 'fetch.prune', 'true');
+  const failed = doctor(a);
+  assert.equal(failed.code, 1);
+  const refspec = doctorLines(failed.out).find((l) => l.startsWith('fail') && l.includes('refs/bell'));
+  assert.ok(refspec?.includes('yogit sync'), failed.out);
+  const fix = refspec.slice(refspec.indexOf('-> ') + 3);
+  const fixed = spawnSync('/bin/sh', ['-c', fix.replace(/ && yogit sync$/, '')], { cwd: a, env: sb.baseEnv, encoding: 'utf8' });
+  assert.equal(fixed.status, 0, `the printed fix runs: ${fix} ${fixed.stderr}`);
+  assert.deepEqual(sb.git(a, 'config', '--get-all', 'remote.origin.fetch').split('\n'), ['+refs/heads/*:refs/remotes/origin/*'], 'and removes only that refspec');
+  assert.doesNotMatch(doctor(a).out, /refs\/bell\/\*:refs\/bell/);
+
+  // (c) A global bell.name, and a shared one with two worktrees.
+  sb.git(repo, 'config', '--global', 'bell.name', 'everywhere');
+  assert.match(doctor(repo).out, /^warn .*git config --global bell\.name everywhere/m);
+  sb.git(repo, 'config', '--global', '--unset', 'bell.name');
+  const wt = join(sb.dir, 'wt');
+  sb.git(repo, 'worktree', 'add', '-q', wt);
+  sb.git(repo, 'config', 'bell.name', 'dana');
+  assert.match(doctor(repo).out, /^warn .*git config --local bell\.name dana names every worktree.*-> .*yogit name/m);
+  sb.git(repo, 'config', '--unset', 'bell.name');
+
+  // A worktree name that outranks an agent is reported, naming the variable; so is a copied name.
+  assert.equal(sb.bell(repo, ['name', 'claude-parser']).code, 0);
+  const outranked = doctor(repo, { CODEX_THREAD_ID: 't' });
+  assert.match(outranked.out, /^warn .*claude-parser.*CODEX_THREAD_ID/m);
+  assert.doesNotMatch(doctor(repo, { CLAUDECODE: '1' }).out, /^warn .*CLAUDECODE/m, 'claude-parser for claude is the point of a name');
+  const copy = join(sb.dir, 'copy');
+  sb.git(repo, 'worktree', 'add', '-q', copy);
+  assert.match(doctor(repo).out, /^warn .*claude-parser names 2 worktrees.*-> yogit name --unset/m);
+  assert.equal(sb.bell(copy, ['name', '--unset']).code, 0);
+  assert.equal(sb.bell(repo, ['name', '--unset']).code, 0);
+
+  // (d) An unrecognised agent-looking variable: named, its value never shown, and the fix is per process.
+  const stray = doctor(repo, { CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT: 'secretish' });
+  assert.match(stray.out, /^warn .*CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT.*-> .*YOGIT_AS=codex/m);
+  assert.ok(!stray.out.includes('secretish'));
+  assert.doesNotMatch(stray.out, /-> yogit name codex/, 'a worktree name would rename the human too');
+  const nested = doctor(repo, { CLAUDECODE: '1', GEMINI_CLI: '1' });
+  assert.match(nested.out, /^warn .*CLAUDECODE.*GEMINI_CLI/m);
+
+  // (e) A hook naming a node that is gone would fail every session: fail. A working one: ok.
+  const hookCommand = HOOK_LINE.exec(sb.bell(repo, ['hooks', 'claude'], { env: { PATH: bin } }).err)[1];
+  const settings = (command) => JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command }] }] } }, null, 2);
+  mkdirSync(join(repo, '.claude'));
+  writeFileSync(join(repo, '.claude', 'settings.local.json'), settings(hookCommand.replaceAll(join(bin, 'node'), '/nonexistent/node')));
+  const stale = doctor(repo);
+  assert.equal(stale.code, 1);
+  assert.match(stale.out, /^fail .*settings\.local\.json.*\/nonexistent\/node.*-> yogit init claude/m);
+  const refreshed = sb.bell(repo, ['init', 'claude', '--yes'], { env: { PATH: bin } });
+  assert.match(refreshed.out, /update - its hook names a node or yogit\.mjs that is gone/, 'init refreshes a stale hook in place');
+  assert.deepEqual(JSON.parse(readFileSync(join(repo, '.claude', 'settings.local.json'), 'utf8')), JSON.parse(settings(hookCommand)));
+  assert.match(doctor(repo).out, /^ok +\.claude\/settings\.local\.json: SessionStart runs yogit ring/m);
+
+  // (f) A ring command that is not a JSON argv.
+  sb.git(repo, 'config', 'bell.ring.codex', '[not json');
+  assert.match(doctor(repo).out, /^warn .*bell\.ring\.codex/m);
+
+  // (g) --json carries the same verdicts and exit code.
+  const json = doctor(repo, {}, ['--json']);
+  const parsed = JSON.parse(json.out);
+  assert.equal(json.code, doctor(repo).code);
+  assert.deepEqual(parsed.checks.map((c) => c.level), doctorLines(doctor(repo).out).map((l) => l.split(' ')[0]));
+  assert.equal(parsed.ok, !parsed.checks.some((c) => c.level === 'fail'));
+
+  // (i) Read-only: refs, config and files are exactly as before.
+  const snapshot = () => [sb.git(repo, 'for-each-ref', 'refs/bell'), sb.git(repo, 'config', '--list', '--show-origin'), tree(sb.dir)];
+  const before = snapshot();
+  doctor(repo);
+  doctor(repo, {}, ['--json']);
+  doctor(a);
+  assert.deepEqual(snapshot(), before);
+}));
+
+// ---------------------------------------------------------------- init
+
+// A repo to set up, with PATH pinned (no stub tools unless named) and a throwaway HOME.
+function initSandbox(sb, { stubs = [], name = 'repo' } = {}) {
+  const bin = pinnedPath(sb, stubs, `bin-${name}`);
+  const repo = sb.repo(name, { commit: true });
+  sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
+  const init = (args, { env = {}, cwd = repo, script } = {}) => sb.bell(cwd, ['init', ...args], { env: { PATH: bin, ...env }, script });
+  const local = join(repo, '.claude', 'settings.local.json');
+  const exclude = join(repo, '.git', 'info', 'exclude');
+  return { bin, repo, init, local, exclude };
+}
+
+const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
+// The group `yogit hooks claude` prints, with only its command swapped: the shape init must write.
+const hookGroup = (sb, command) => {
+  const printed = JSON.parse(sb.bell(sb.dir, ['hooks', 'claude']).out).hooks.SessionStart[0];
+  printed.hooks[0].command = command;
+  return printed;
+};
+const initCommand = (sb, bin) => HOOK_LINE.exec(sb.bell(sb.dir, ['hooks', 'claude'], { env: { PATH: bin } }).err)[1];
+
+test('init: without a terminal and without --yes it only shows the plan, and changes nothing', () => withSandbox((sb) => {
+  const { repo, init, local, bin } = initSandbox(sb);
+  const state = () => [sb.git(repo, 'status', '--porcelain', '--ignored'), sb.git(repo, 'config', '--list', '--show-origin'), tree(sb.dir)];
+  const before = state();
+  const dry = init(['claude', 'cursor', '--name', 'x']);
+  assert.equal(dry.code, 0, dry.err);
+  assert.match(dry.out, /to apply: yogit init claude cursor --name x --yes/);
+  assert.match(dry.out, /settings\.local\.json/);
+  assert.match(dry.out, /info\/exclude/);
+  assert.match(dry.out, /bell\.name/);
+  assert.deepEqual(state(), before, 'working tree, status, config (with --name) and HOME are unchanged');
+  assert.equal(init(['claude', '--dry-run', '--yes']).code, 2, '--dry-run and --yes contradict each other');
+  // Positive control: the same comparison sees what --yes changes.
+  assert.equal(init(['claude', 'cursor', '--name', 'x', '--yes']).code, 0);
+  assert.notDeepEqual(state(), before);
+  assert.deepEqual(readJson(local).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+}));
+
+test('init claude merges one hook into settings.local.json, leaves the rest alone, runs without node on PATH, and undoes exactly', { skip: process.platform === 'win32' && 'POSIX sh only' }, () => withSandbox((sb) => {
+  const { repo, init, local, exclude, bin } = initSandbox(sb);
+  sentId(sb.bell(repo, ['send', 'claude', 'hi', '--as', 'codex']));
+  mkdirSync(join(repo, '.claude'));
+  const theirs = {
+    permissions: { allow: ['Bash(npm test)'] },
+    env: { SECRET: 'canary-123' },
+    hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo hello' }] }], Stop: [{ hooks: [{ type: 'command', command: 'true' }] }] },
+  };
+  const original = `${JSON.stringify(theirs, null, 2)}\n`;
+  writeFileSync(local, original);
+  const excludeBefore = readFileSync(exclude, 'utf8');
+
+  // (b) Everything but the new entry is exactly as it was, and no secret is printed.
+  const first = init(['claude', '--yes']);
+  assert.equal(first.code, 0, first.out + first.err);
+  assert.ok(!(first.out + first.err).includes('canary-123'), 'init never prints a settings file');
+  const merged = readJson(local);
+  const command = initCommand(sb, bin);
+  assert.deepEqual(merged.hooks.SessionStart.at(-1), hookGroup(sb, command), 'the shape `yogit hooks claude` prints, command swapped');
+  merged.hooks.SessionStart.pop();
+  assert.deepEqual(merged, theirs);
+  assert.equal(sb.git(repo, 'status', '--porcelain'), '', 'the local settings file is excluded, so status stays clean');
+  assert.match(readFileSync(exclude, 'utf8'), /^# yogit\n\/\.claude\/settings\.local\.json$/m);
+
+  // (c) The written command rings under a PATH with no node on it.
+  const nodeless = onlyOnPath(sb, 'nodeless', ['sh', 'git', 'env']);
+  const ran = spawnSync('/bin/sh', ['-c', command], { cwd: repo, env: { ...sb.baseEnv, PATH: nodeless, CLAUDECODE: '1' }, encoding: 'utf8' });
+  assert.equal(ran.stdout, 'yogit: 1 unread for claude (from codex) - run: yogit inbox\n', ran.stderr);
+
+  // (d) Again: nothing to do, and not a byte changes.
+  const bytes = readFileSync(local, 'utf8');
+  const again = init(['claude', '--yes']);
+  assert.match(again.out, /already set up/);
+  assert.equal(readFileSync(local, 'utf8'), bytes);
+
+  // (e) Undo: the file is byte for byte what it was, and the exclude lines are gone.
+  const undo = init(['claude', '--undo', '--yes']);
+  assert.equal(undo.code, 0, undo.out + undo.err);
+  assert.equal(readFileSync(local, 'utf8'), original);
+  assert.equal(readFileSync(exclude, 'utf8'), excludeBefore);
+
+  // A file init created is removed with its directory, and status is back to what it was.
+  rmSync(join(repo, '.claude'), { recursive: true });
+  const status = sb.git(repo, 'status', '--porcelain');
+  assert.equal(init(['claude', '--yes']).code, 0);
+  assert.deepEqual(readJson(local), { hooks: { SessionStart: [hookGroup(sb, command)] } });
+  assert.equal(init(['claude', '--undo', '--yes']).code, 0);
+  assert.equal(existsSync(join(repo, '.claude')), false);
+  assert.equal(sb.git(repo, 'status', '--porcelain'), status);
+}));
+
+test('init leaves hooks it did not write alone, keeps 4-space and tab files byte for byte, and follows a symlink', () => withSandbox((sb) => {
+  const { repo, init, local, bin } = initSandbox(sb);
+  mkdirSync(join(repo, '.claude'));
+  // (f) A hand-written yogit hook counts as set up: no second entry, no double ring, and undo keeps it.
+  for (const command of ['yogit ring', 'yogit ring --as x']) {
+    const hand = `${JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command }] }] } }, null, 2)}\n`;
+    writeFileSync(local, hand);
+    assert.match(init(['claude', '--yes']).out, /already set up/);
+    assert.equal(readFileSync(local, 'utf8'), hand);
+    const undo = init(['claude', '--undo', '--yes']);
+    assert.match(undo.out, /kept/);
+    assert.ok(undo.out.includes(command));
+    assert.equal(readFileSync(local, 'utf8'), hand, `${command} survives init and undo`);
+  }
+  // Another scope's yogit hook counts too: Claude runs every scope's hooks.
+  rmSync(local);
+  writeFileSync(join(repo, '.claude', 'settings.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'yogit ring' }] }] } }));
+  assert.match(init(['claude', '--yes']).out, /already set up.*settings\.json/);
+  assert.equal(existsSync(local), false);
+  rmSync(join(repo, '.claude', 'settings.json'));
+
+  // The file's own indent and final newline are kept, so undo gives back the same bytes.
+  for (const [indent, newline] of [[4, '\n'], ['\t', '\n'], [2, '']]) {
+    const original = JSON.stringify({ permissions: { allow: ['Read'] }, model: 'x' }, null, indent) + newline;
+    writeFileSync(local, original);
+    assert.equal(init(['claude', '--yes']).code, 0);
+    const written = readFileSync(local, 'utf8');
+    assert.ok(written.includes(`${typeof indent === 'number' ? ' '.repeat(indent) : indent}"hooks"`), written);
+    assert.equal(written.endsWith('\n'), newline === '\n');
+    assert.equal(init(['claude', '--undo', '--yes']).code, 0);
+    assert.equal(readFileSync(local, 'utf8'), original, `indent ${JSON.stringify(indent)}`);
+  }
+  // A layout JSON.stringify would not produce is said up front: its whitespace changes.
+  writeFileSync(local, '{ "model": "x" }\n');
+  assert.match(init(['claude']).out, /whitespace/);
+
+  // (h) A symlinked settings file stays a symlink; its target gets the entry.
+  rmSync(local);
+  mkdirSync(join(sb.dir, 'dotfiles'));
+  const target = join(sb.dir, 'dotfiles', 'claude-local.json');
+  writeFileSync(target, '{}\n');
+  symlinkSync(target, local);
+  assert.equal(init(['claude', '--yes']).code, 0);
+  assert.equal(readlinkSync(local), target);
+  assert.deepEqual(readJson(target).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+}));
+
+test('init refuses a settings file that is not strict JSON, prints the fragment instead, and still does the rest', () => withSandbox((sb) => {
+  const { repo, init, local } = initSandbox(sb);
+  mkdirSync(join(repo, '.claude'));
+  const jsonc = '{\n  // my settings\n  "model": "x"\n}\n';
+  writeFileSync(local, jsonc);
+  const r = init(['claude', 'cursor', '--yes']);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /refused/);
+  assert.match(r.out, /"SessionStart"/, 'the fragment to paste by hand');
+  assert.equal(readFileSync(local, 'utf8'), jsonc, 'not a byte changed');
+  assert.ok(existsSync(join(repo, '.cursor', 'rules', 'yogit.mdc')), 'the cursor rule was still written');
+}));
+
+test('init --user writes only under HOME (or CLAUDE_CONFIG_DIR) and CODEX_HOME, never in the repo', () => withSandbox((sb) => {
+  const { repo, init, bin } = initSandbox(sb);
+  const codexHome = join(sb.dir, 'codex-home');
+  const repoTree = tree(repo);
+  const r = init(['claude', 'codex', '--user', '--yes'], { env: { CODEX_HOME: codexHome } });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(readJson(join(sb.dir, '.claude', 'settings.json')).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+  assert.match(readFileSync(join(codexHome, 'AGENTS.md'), 'utf8'), /^<!-- yogit:begin -->\n## Agent mailbox \(yogit\)[\s\S]*<!-- yogit:end -->\n$/);
+  assert.deepEqual(tree(repo), repoTree, 'the repo is untouched');
+  const elsewhere = join(sb.dir, 'claude-config');
+  assert.equal(init(['claude', '--user', '--yes'], { env: { CLAUDE_CONFIG_DIR: elsewhere } }).code, 0);
+  assert.ok(existsSync(join(elsewhere, 'settings.json')), 'CLAUDE_CONFIG_DIR is where Claude Code reads user settings from');
+  assert.equal(init(['claude', 'codex', '--user', '--undo', '--yes'], { env: { CODEX_HOME: codexHome } }).code, 0);
+  assert.equal(existsSync(join(sb.dir, '.claude', 'settings.json')), false);
+  assert.equal(existsSync(join(codexHome, 'AGENTS.md')), false);
+}));
+
+test('init from npx refuses to write a hook into its disposable cache', () => withSandbox((sb) => {
+  const { repo, init, exclude } = initSandbox(sb);
+  const cached = join(sb.dir, '_npx', 'abc', 'node_modules', '@yoam', 'yogit', 'yogit.mjs');
+  mkdirSync(join(cached, '..'), { recursive: true });
+  writeFileSync(cached, SOURCE);
+  const before = [tree(repo), readFileSync(exclude, 'utf8')];
+  const r = init(['claude', '--yes'], { script: cached });
+  assert.match(r.out, /npm i -g @yoam\/yogit/);
+  assert.deepEqual([tree(repo), readFileSync(exclude, 'utf8')], before, 'nothing written');
+}));
+
+test('init cursor: create-only, kept out of git status, and undo keeps what another worktree still needs', () => withSandbox((sb) => {
+  const { repo, init, exclude } = initSandbox(sb);
+  const rule = join(repo, '.cursor', 'rules', 'yogit.mdc');
+  const printed = sb.bell(sb.dir, ['hooks', 'cursor']).out;
+  const excludeBefore = readFileSync(exclude, 'utf8');
+  assert.equal(init(['cursor', '--yes']).code, 0);
+  assert.equal(readFileSync(rule, 'utf8'), printed, 'the same bytes `yogit hooks cursor` prints');
+  assert.equal(sb.git(repo, 'status', '--porcelain'), '');
+  // (k) A different yogit.mdc is someone's: left alone, and said so.
+  writeFileSync(rule, 'mine\n');
+  assert.match(init(['cursor', '--yes']).out, /left alone/);
+  assert.equal(readFileSync(rule, 'utf8'), 'mine\n');
+  assert.match(init(['cursor', '--undo', '--yes']).out, /kept/);
+  assert.equal(readFileSync(rule, 'utf8'), 'mine\n');
+  rmSync(join(repo, '.cursor'), { recursive: true });
+
+  // info/exclude is shared by every worktree: undo in one keeps the line another still uses.
+  const other = join(sb.dir, 'other');
+  sb.git(repo, 'worktree', 'add', '-q', other);
+  assert.equal(init(['cursor', '--yes']).code, 0);
+  assert.equal(init(['cursor', '--yes'], { cwd: other }).code, 0);
+  assert.equal(init(['cursor', '--undo', '--yes']).code, 0);
+  assert.equal(existsSync(join(repo, '.cursor')), false);
+  assert.match(readFileSync(exclude, 'utf8'), /\/\.cursor\/rules\/yogit\.mdc/, 'kept for the other worktree');
+  assert.equal(sb.git(other, 'status', '--porcelain'), '');
+  assert.equal(init(['cursor', '--undo', '--yes'], { cwd: other }).code, 0);
+  assert.equal(readFileSync(exclude, 'utf8'), excludeBefore, 'gone with the last one');
+}));
+
+test('init codex: AGENTS.md is shared, so it is written only with --project (or --user), and undone byte for byte', () => withSandbox((sb) => {
+  const { repo, init } = initSandbox(sb);
+  const agents = join(repo, 'AGENTS.md');
+  const original = '# Project\n\nsome text\n';
+  writeFileSync(agents, original);
+  const plain = init(['codex', '--yes']);
+  assert.equal(plain.code, 0);
+  assert.match(plain.out, /--project/);
+  assert.equal(readFileSync(agents, 'utf8'), original, 'a tracked, team-shared file is not written by default');
+  assert.equal(init(['codex', '--project', '--yes']).code, 0);
+  const text = readFileSync(agents, 'utf8');
+  assert.ok(text.startsWith(original), 'the block is added after what was there');
+  assert.ok(text.includes(sb.bell(sb.dir, ['hooks', 'codex']).out.trimEnd()));
+  assert.match(init(['codex', '--project', '--yes']).out, /already set up/);
+  assert.equal(init(['codex', '--project', '--undo', '--yes']).code, 0);
+  assert.equal(readFileSync(agents, 'utf8'), original);
+
+  // gemini, agy and aider get advice and no files; aider sets no variable, so it gets a name by hand.
+  const status = sb.git(repo, 'status', '--porcelain', '--ignored');
+  const advice = init(['gemini', 'agy', 'aider', '--yes']);
+  assert.equal(advice.code, 0);
+  assert.match(advice.out, /YOGIT_AS=aider aider/);
+  assert.match(advice.out, /GEMINI_CLI/);
+  assert.match(advice.out, /ANTIGRAVITY_AGENT/);
+  assert.equal(sb.git(repo, 'status', '--porcelain', '--ignored'), status, 'no files');
+}));
+
+test('init: mail sync is a separate, opt-in step, and no refspec is ever written', () => withSandbox((sb) => {
+  const bin = pinnedPath(sb);
+  const { bare, a, b } = hubAndClones(sb);
+  sentId(sb.bell(a, ['send', 'bob', 'waiting for you', '--as', 'alice']));
+  assert.equal(sb.bell(a, ['sync', '--as', 'alice']).code, 0);
+  const init = (args) => sb.bell(b, ['init', 'cursor', ...args], { env: { PATH: bin, BELL_AS: 'bob' } });
+  const fetch = sb.git(b, 'config', '--get-all', 'remote.origin.fetch');
+  const hub = sb.refs(bare);
+  assert.match(init([]).out, /yogit sync/, '(l) the dry run names the next step');
+  assert.equal(init(['--yes']).code, 0);
+  assert.deepEqual(sb.refs(b), [], 'plain --yes stays local: nothing fetched');
+  assert.deepEqual(sb.refs(bare), hub, 'and nothing pushed');
+  const synced = init(['--yes', '--sync']);
+  assert.equal(synced.code, 0, synced.out + synced.err);
+  assert.equal(inboxJson(sb, b, 'bob').messages[0].body, 'waiting for you');
+  assert.equal(sb.git(b, 'config', '--get-all', 'remote.origin.fetch'), fetch, 'no refs/bell refspec');
+}));
+
+test('init finds the tools on PATH, and naming tools replaces that', () => withSandbox((sb) => {
+  const none = initSandbox(sb, { name: 'none' });
+  const bare = none.init([]);
+  assert.equal(bare.code, 0);
+  const toolLines = (out) => out.split('\n').filter((l) => /^  (claude|codex|cursor|gemini|agy|aider) /.test(l)).map((l) => l.trim().split(' ')[0]);
+  assert.match(bare.out, /no agent tools found/, 'negative control: nothing on PATH, nothing detected');
+  assert.deepEqual(toolLines(bare.out), []);
+  const found = initSandbox(sb, { name: 'found', stubs: ['claude', 'codex'] });
+  const plan = found.init([]).out;
+  assert.deepEqual([...new Set(toolLines(plan))], ['claude', 'codex'], plan);
+  assert.match(plan, /settings\.local\.json/);
+  const named = found.init(['cursor']).out;
+  assert.deepEqual([...new Set(toolLines(named))], ['cursor'], named);
+  assert.equal(found.init(['vim']).code, 2);
+  // (n) Outside a repo there is nothing to set up yet.
+  const outside = join(sb.dir, 'outside');
+  mkdirSync(outside);
+  const out = sb.bell(outside, ['init'], { env: { PATH: found.bin } });
+  assert.equal(out.code, 1);
+  assert.match(out.out + out.err, /git init/);
+}));
+
+const SCRIPT = process.platform === 'linux' ? spawnSync('sh', ['-c', 'command -v script'], { encoding: 'utf8' }).stdout.trim() : '';
+const hasScript = SCRIPT.startsWith('/') && !spawnSync(SCRIPT, ['--version'], { stdio: 'ignore' }).error;
+
+test('init at a terminal asks before it writes', { skip: !hasScript && 'util-linux script not found' }, () => withSandbox((sb) => {
+  const { repo, bin } = initSandbox(sb);
+  const rule = join(repo, '.cursor', 'rules', 'yogit.mdc');
+  const atTerminal = (answer) => spawnSync(SCRIPT, ['-qec', `${process.execPath} ${YOGIT} init cursor`, '/dev/null'], {
+    cwd: repo, env: { ...sb.baseEnv, PATH: bin }, encoding: 'utf8', input: answer, timeout: 20000,
+  });
+  const no = atTerminal('n\n');
+  assert.match(no.stdout, /\[y\/N\]/, no.stdout + no.stderr);
+  assert.equal(existsSync(rule), false, 'no is no');
+  const yes = atTerminal('y\n');
+  assert.match(yes.stdout, /\[y\/N\]/);
+  assert.ok(existsSync(rule), yes.stdout + yes.stderr);
+}));
+
+test('init on Windows prints the Claude hook instead of writing it', { skip: process.platform !== 'win32' && 'Windows only' }, () => withSandbox((sb) => {
+  const repo = sb.repo('repo', { commit: true });
+  const r = sb.bell(repo, ['init', 'claude', '--yes'], { env: { BELL_AS: 'x' } });
+  assert.match(r.out, /"SessionStart"/);
+  assert.equal(existsSync(join(repo, '.claude', 'settings.local.json')), false);
 }));
 
 test('"git yogit" works as a git subcommand when git-yogit is on PATH', () => withSandbox((sb) => {
@@ -1125,6 +1846,47 @@ test('the README 60-second demo runs as written, in one shell, and never leaves 
   assert.match(r.stdout, /^yogit: 1 unread for claude \(from codex\) - run: yogit inbox$/m);
   assert.match(r.stdout, /deal - I'll take the docs instead/);
   assert.match(r.stdout, /^yogit: 1 sent by claude\n  \d{8}-\d{6}-[0-9a-f]{6}  -> codex  read  heads up\n$/m, 'the outbox ends it: codex has read the note');
+}));
+
+test('README quickstart: five lines at most, install first, and the yogit lines run as written', { skip: !hasBash && 'bash not found' }, () => withSandbox((sb) => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const after = readme.split(/^## Quickstart\s*$/m)[1];
+  assert.ok(after !== undefined, 'a Quickstart section');
+  const block = after.match(/^```sh\n([\s\S]*?)^```$/m)[1];
+  const lines = block.split('\n').filter((l) => l.trim());
+  assert.ok(lines.length <= 5, `at most 5 commands: ${lines.length}`);
+  assert.equal(lines[0], 'npm i -g @yoam/yogit');
+  assert.ok(!lines.some((l) => /--as|YOGIT_AS|BELL_AS/.test(l)), 'the quickstart never acts as an agent in your real repo');
+  // Run it: the npm line skipped, yogit on PATH, a throwaway HOME, stdin not a terminal (so init only shows its plan).
+  const bin = pinnedPath(sb);
+  const repo = sb.repo('mine');
+  sb.git(repo, 'config', 'user.name', 'Ada Lovelace');
+  const bash = spawnSync('sh', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+  const r = spawnSync(bash, ['-e', '-c', lines.filter((l) => !l.startsWith('npm ')).join('\n')], { cwd: repo, env: { ...sb.baseEnv, PATH: bin }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^yogit init - you are ada-lovelace/m);
+  assert.match(r.stdout, /^yogit: sent \S+ to codex$/m);
+  assert.match(r.stdout, /-> codex {2}sent {2}tests are green$/m, 'the outbox shows the note waiting for codex');
+}));
+
+test('README: the commands table lists every command in help, and the old advice is gone', () => withSandbox((sb) => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const table = readme.split(/^## Commands\s*$/m)[1].split(/^## /m)[0];
+  const help = sb.bell(sb.dir, ['help']).out;
+  const commands = [...help.matchAll(/^ {2}([a-z][a-z0-9-]*)\b/gm)].map((m) => m[1]);
+  assert.ok(commands.length >= 20, commands.join(' '));
+  for (const cmd of commands) assert.ok(table.includes(`\`yogit ${cmd}`), `the Commands table has yogit ${cmd}`);
+  assert.ok(table.includes('| `yogit` |'), 'and bare yogit');
+  for (const gone of ['command -v yogit', 'run: git config bell.name']) {
+    assert.ok(!readme.includes(gone), `the README no longer says ${JSON.stringify(gone)}`);
+  }
+  const demo = README_SH.filter((b) => /yogit-demo/.test(b));
+  assert.match(demo[1], /^cd \.\.\/yogit-demo-codex &&/, 'terminal 2 stops if the cd fails, before anything runs in your own repo');
+  assert.match(demo[2], /^cd \.\.\/yogit-demo &&/);
+  assert.ok(!demo.join('\n').includes('BELL_AS'), 'the demo uses YOGIT_AS');
+  assert.match(readme, /YOGIT_AS=aider aider/);
+  assert.match(readme, /GEMINI_CLI/);
+  assert.match(readme, /ANTIGRAVITY_AGENT/);
 }));
 
 // ---------------------------------------------------------------- 2.1: message lifecycle
