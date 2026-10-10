@@ -17,7 +17,8 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 const VERSION = '2.1.0';
 
@@ -42,6 +43,7 @@ const STATES = Object.freeze({
   ARCHIVED: 'archived',
   UNARCHIVED: 'unarchived',
   DELETED: 'deleted',
+  EXPIRED: 'expired', // gc explicitly retired unread mail
   RELAYED: 'relayed', // reserved for a future mailroom: read if present, never written
 });
 const STORED = new Set(Object.values(STATES).filter((s) => s !== STATES.SENT && s !== STATES.REPLIED));
@@ -525,7 +527,7 @@ function fold(box, m, name) {
   const progress = PROGRESS.filter((s) => seen.has(s)).at(-1);
   const view = {
     name,
-    state: deleted ? STATES.DELETED : archived ? STATES.ARCHIVED : progress,
+    state: seen.has(STATES.EXPIRED) ? STATES.EXPIRED : deleted ? STATES.DELETED : archived ? STATES.ARCHIVED : progress,
     progress,
     delivered: seen.has(STATES.DELIVERED),
     notified: seen.has(STATES.NOTIFIED),
@@ -657,7 +659,8 @@ function findMessage(box, rawId, me) {
   const { letter: m, tomb } = findTarget(box, rawId, me);
   if (m) return m;
   const { actor, ts } = tomb.deleted;
-  throw new BellError(`${tomb.msg} was deleted by ${actor} ${ts.slice(0, 10)} ${ts.slice(11, 16)} UTC (yogit status ${tomb.msg})`);
+  const state = tomb.trail.some((e) => e.state === STATES.EXPIRED) ? STATES.EXPIRED : STATES.DELETED;
+  throw new BellError(`${tomb.msg} was ${state} by ${actor} ${ts.slice(0, 10)} ${ts.slice(11, 16)} UTC (yogit status ${tomb.msg})`);
 }
 
 function findLetter(box, rawId, me) {
@@ -1100,7 +1103,14 @@ function tombstone(m, entries, author, ts) {
     if (!trail.has(id)) trail.set(id, { id, to, state, ts: at, actor, via, legacy });
   }
   const tomb = { v: 1, kind: 'tomb', msg: m.id, to: m.to, from: m.from, sent: m.ts, trail: [...trail.values()].sort(byTime) };
-  return commitJson(tomb, author, ts);
+  const oid = commitJson(tomb, author, ts);
+  // Check the actual commit, including its headers, against the reader's
+  // 1 MiB limit before any source ref can be removed (#12).
+  const parsed = parseTomb(readObjects([oid]).get(oid), m.to, m.id);
+  if (!parsed || parsed.trail.length !== tomb.trail.length) {
+    throw new BellError(`cannot retire ${m.id}: replacement tombstone exceeds the readable 1 MiB limit or has unreadable entries; source refs kept`);
+  }
+  return oid;
 }
 
 const tombInTheWay = (ref) => `${ref} is in the way: it is not a tombstone this yogit writes. If nothing else uses it, remove it with: git update-ref -d ${ref}`;
@@ -1143,7 +1153,7 @@ const entryJson = (e) => ({ state: e.state, ts: e.ts, actor: e.actor, ...(e.via 
 // "sent 2026-09-25 10:02 UTC → delivered 10:05 (codex) → read 10:07": the date
 // when it changes, and who acted when that changes. Archiving and deleting
 // always say who did it, since the sender or the recipient may have.
-const NAMED = new Set([STATES.ARCHIVED, STATES.UNARCHIVED, STATES.DELETED]);
+const NAMED = new Set([STATES.ARCHIVED, STATES.UNARCHIVED, STATES.DELETED, STATES.EXPIRED]);
 
 function timelineText(timeline) {
   let day = '';
@@ -1215,7 +1225,7 @@ function cmdOutbox(opts) {
   // An archived or deleted letter also says how far it got first: "deleted (read)".
   const shown = (m, name) => {
     const { state, progress } = fold(box, m, name);
-    return state === STATES.ARCHIVED || state === STATES.DELETED ? `${state} (${progress})` : state;
+    return state === STATES.ARCHIVED || state === STATES.DELETED || state === STATES.EXPIRED ? `${state} (${progress})` : state;
   };
   if (opts.json) {
     const messages = rows.map(({ m, recipients }) => ({
@@ -1453,6 +1463,19 @@ function cmdSync(opts, [remoteArg]) {
   }
   const line = me ? ringLine(box, me) : '';
   if (line) console.log(line);
+  if (!refused.length && me && gcEnabled('bell.gc.auto')) {
+    const raw = gitConfig('bell.gc.autoRefs') || '2000';
+    const threshold = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(threshold)) {
+      throw usage('bell.gc.autoRefs must be a non-negative integer (default: 2000)');
+    }
+    const count = [...listRefs().keys()].filter((ref) => mailRef(ref)).length;
+    if (count > threshold) {
+      console.log(`yogit: auto gc: ${count} mailbox refs exceed ${threshold}`);
+      const remoteGc = gcEnabled('bell.gc.autoRemote');
+      cmdGc({ as: me, remote: remoteGc, apply: remoteGc }, { remote });
+    }
+  }
 }
 
 function cmdWho(opts) {
@@ -1495,14 +1518,30 @@ function cmdWho(opts) {
 // recipient) has read, leaving a tombstone for each, and folds a deleted
 // letter's events and read marks into tombstones (the timeline stays readable
 // in them). A letter deleted earlier folds once its deletion is older than N
-// days. Then it packs the refs into one file. It never deletes unread,
-// archived or privately read mail, broadcasts (which have no single owner),
-// or other people's mail: gc does nothing for everyone that delete would not.
+// days. Then it packs the refs into one file. Unread expiry and remote
+// deletion are separate opt-ins. Archived or privately read mail, broadcasts
+// (which have no single owner), and other people's mail stay protected.
 function parseAge(raw) {
   const m = String(raw ?? '30d').match(/^(\d{1,5})d?$/);
   if (!m) throw usage('--older-than takes a number of days, such as 30d (0d means any age)');
   const days = Number(m[1]);
   return { days, label: `${days}d` };
+}
+
+function parseExpiryAge(raw) {
+  if (raw === undefined) return undefined;
+  const match = String(raw).match(/^(\d{1,9})([smhdw])$/);
+  if (!match) throw usage('--expire-unread takes an age such as 72h or 30d (units: s, m, h, d, w)');
+  return Number(match[1]) * { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[match[2]];
+}
+
+function gcEnabled(key) {
+  try {
+    return git(['config', '--type=bool', '--get', key]).trim() === 'true';
+  } catch (err) {
+    if (!(err instanceof BellError) || err.gitStatus !== 1) throw usage(`${key} must be true or false`);
+    return false;
+  }
 }
 
 // Deleting is final, so only the owner's own record counts: a read or acked
@@ -1515,8 +1554,14 @@ function ownerRead(box, m) {
   return own.length ? 'private' : '';
 }
 
-function cmdGc(opts) {
+function cmdGc(opts, { remote = 'origin' } = {}) {
   const { days, label } = parseAge(opts['older-than']);
+  const expiryAge = parseExpiryAge(opts['expire-unread']);
+  if (opts.archive !== undefined && (!opts.remote || !opts.archive || opts.archive.startsWith('--'))) {
+    throw usage('--archive needs a bundle file and --remote');
+  }
+  if (opts.archive && existsSync(opts.archive)) throw usage('gc archive already exists; choose a new bundle file');
+  if (opts.apply && !opts.remote) throw usage('--apply needs --remote');
   requireRepo();
   const me = whoAmI(opts); // gc deletes only mail you sent or received, so it needs to know who you are
   const now = new Date();
@@ -1526,26 +1571,29 @@ function cmdGc(opts) {
   const dry = opts['dry-run'];
   const kept = { unread: 0, newer: 0, archived: 0, broadcasts: 0, others: 0, private: 0 };
   let letters = 0;
+  let expired = 0;
   let before = 0; // letters here that were deleted before, somewhere
   let events = 0;
   let marks = 0;
   const lines = [];
   const blocked = [];
+  const planned = new Map();
   // Settle one letter: its shared events and read marks go, and a new
   // tombstone keeps every one that no tombstone here keeps yet. Nothing is
   // dropped unkept. Private receipts, which a synced tombstone must not
   // carry, and events this version cannot read stay where they are.
   const settle = (m, keeps, extra = []) => {
     const fresh = [...extra, ...sharedEntries(box, m.id, m).filter((e) => !keeps.has(e.id))];
+    const trail = [...(box.tombs.get(m.id)?.trail ?? []), ...fresh];
     if (fresh.length) {
       const blocking = inTheWay(box, m);
       if (blocking) {
         blocked.push(blocking);
         return false;
       }
-      const trail = [...(box.tombs.get(m.id)?.trail ?? []), ...fresh];
       if (!dry) lines.push(`create ${tombRef(m, now)} ${tombstone(m, trail, me, now.toISOString())}\n`);
     }
+    planned.set(m.id, { id: m.id, to: m.to, from: m.from, ts: m.ts, trail });
     for (const e of box.byMsg.get(m.id) ?? []) {
       if (e.local) continue;
       lines.push(`delete ${e.ref} ${e.oid}\n`);
@@ -1564,13 +1612,24 @@ function cmdGc(opts) {
     else if (m.from !== me && m.to !== me) kept.others += 1;
     else {
       const read = ownerRead(box, m);
-      if (!read) kept.unread += 1;
+      const expire = expiryAge !== undefined && !read && !fold(box, m, m.to).archived
+        && Date.parse(m.ts) < now.getTime() - expiryAge;
+      if (!read && !expire) kept.unread += 1;
       else if (fold(box, m, m.to).archived) kept.archived += 1;
       else if (read === 'private') kept.private += 1;
-      else if (!old(m.ts)) kept.newer += 1;
+      else if (!expire && !old(m.ts)) kept.newer += 1;
       else {
         const deleted = { id: newEventId(STATES.DELETED, now), to: m.to, state: STATES.DELETED, ts: now.toISOString(), actor: me, via: 'gc' };
-        if (!settle(m, new Set(), [deleted])) continue;
+        // Keep the deletion marker for older readers: they do not know
+        // expired, but must still honor the tombstone and never resurrect it.
+        const expiry = expire && (dry
+          ? { entry: { ...deleted, id: newEventId(STATES.EXPIRED, now), state: STATES.EXPIRED } }
+          : newEvent({ to: m.to, msg: m.id, state: STATES.EXPIRED, actor: me, via: 'gc' }, { now }));
+        if (!settle(m, new Set(), expiry ? [deleted, expiry.entry] : [deleted])) continue;
+        if (expiry) {
+          expired += 1;
+          if (!dry) lines.push(expiry.line);
+        }
         lines.push(`delete refs/bell/inbox/${m.to}/${m.id} ${m.oid}\n`);
         letters += 1;
       }
@@ -1590,13 +1649,185 @@ function cmdGc(opts) {
   const counts = `${plural(letters, 'message')}${before ? ` (+${before} already deleted)` : ''}, folding ${plural(events, 'event')} and ${plural(marks, 'read mark')} into tombstones`;
   if (dry) {
     console.log(`yogit: gc would delete ${counts}; ${keptText} (dry run: nothing changed)`);
+    if (expiryAge !== undefined || opts.remote) {
+      for (const m of box.messages.filter((m) => planned.has(m.id))) {
+        const action = planned.get(m.id).trail.some((e) => e.state === STATES.EXPIRED) ? 'expire' : 'delete';
+        console.log(`yogit: gc would ${action} ${m.id}`);
+      }
+    }
+    if (expiryAge !== undefined) console.log(`yogit: gc would expire ${plural(expired, 'message')}`);
+    if (opts.remote) gcRemote(opts, { planned, remote });
     return;
   }
   updateRefs(lines);
   git(['pack-refs', '--all']);
   console.log(`yogit: gc deleted ${counts}; ${keptText}; packed refs`);
-  if (letters && git(['remote']).trim()) {
+  if (expiryAge !== undefined) console.log(`yogit: gc expired ${plural(expired, 'message')}`);
+  if (opts.remote) gcRemote(opts, { remote });
+  else if (letters && git(['remote']).trim()) {
     warn('gc left a tombstone for each letter it deleted, and yogit sync shares them, so no clone brings these letters back. sync never deletes, so the remote keeps its copies until you delete them there.');
+  }
+}
+
+// Remote gc removes only mail whose shared history is already in a tombstone.
+// The ordinary sync path never prunes. Keeping this separate also makes the
+// remote half a plan until --apply is present, even when local gc has run.
+function gcRemote(opts, { planned = new Map(), remote = 'origin' } = {}) {
+  const me = whoAmI(opts);
+  if (!git(['remote']).split('\n').includes(remote)) throw usage(`no remote named "${remote}"`);
+  if (opts.apply && !opts['dry-run']) {
+    const fetchUrls = git(['remote', 'get-url', '--all', remote]).trim().split('\n');
+    const pushUrls = git(['remote', 'get-url', '--push', '--all', remote]).trim().split('\n');
+    if (fetchUrls.length !== 1 || pushUrls.length !== 1 || fetchUrls[0] !== pushUrls[0]) {
+      throw new BellError('gc remote refused: fetch and push must use the same single remote URL for verified deletion');
+    }
+  }
+  const remoteRefs = () => {
+    const refs = new Map();
+    for (const line of git(['ls-remote', remote, 'refs/bell/*']).split('\n')) {
+      const [oid, ref] = line.split('\t');
+      if (ref?.startsWith('refs/bell/') && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(oid)) refs.set(ref, oid);
+    }
+    return refs;
+  };
+  const theirs = remoteRefs();
+  const box = loadMailbox();
+  const retired = new Map();
+  const owned = (m) => m.to !== BROADCAST && (m.to === me || m.from === me);
+  for (const [id, tomb] of box.tombs) {
+    const m = { id, to: tomb.to, from: tomb.from, ts: tomb.sent, trail: tomb.trail };
+    if (owned(m)) retired.set(id, m);
+  }
+  if (opts['dry-run']) for (const [id, m] of planned) if (owned(m)) retired.set(id, m);
+  const localTombs = [...box.refs].filter(([ref]) => mailRef(ref)?.kind === 'tomb');
+  const objects = readObjects([...new Set([...theirs.values(), ...localTombs.map(([, oid]) => oid)])]);
+  const tombRecords = localTombs.map(([ref, oid]) => {
+    const found = mailRef(ref);
+    return { ref, oid, tomb: parseTomb(objects.get(oid), found.who, found.id) };
+  }).filter(({ tomb }) => tomb);
+  for (const [id, m] of retired) {
+    if (opts['dry-run'] && planned.has(id)) continue;
+    m.trail = tombRecords.filter(({ tomb }) => tomb.msg === id && tomb.to === m.to && tomb.from === m.from && tomb.sent === m.ts)
+      .flatMap(({ tomb }) => tomb.trail);
+  }
+  const sameEntry = (a, b) => ['id', 'to', 'state', 'ts', 'actor', 'via'].every((key) => a[key] === b[key])
+    && Boolean(a.legacy) === Boolean(b.legacy);
+  const sameLetter = (letter, m) => letter && letter.from === m.from && letter.to === m.to && letter.ts === m.ts;
+  const removing = new Map();
+  const ids = new Set();
+  let unavailable = 0;
+  for (const [ref, oid] of theirs) {
+    const found = mailRef(ref);
+    if (!found || found.local || found.kind === 'tomb') continue;
+    const m = retired.get(found.id);
+    if (!m) continue;
+    if (!objects.has(oid)) {
+      unavailable += 1;
+      continue;
+    }
+    const trail = m.trail ?? [];
+    let safe = false;
+    if (found.kind === 'inbox') {
+      safe = found.who === m.to && sameLetter(parseMessage(objects.get(oid), found.who, found.id), m);
+    } else if (found.kind === 'event') {
+      const event = parseEvent(objects.get(oid), found.who, found.id);
+      safe = event && trail.some((entry) => sameEntry(entry, { ...event, id: found.eventId, to: found.who }));
+    } else if (found.kind === 'ack') {
+      // A mark is meaningful only when it points to the original letter and
+      // both of the legacy entries it stands for were preserved in the trail.
+      safe = sameLetter(parseMessage(objects.get(oid), m.to, m.id), m)
+        && legacyEntries(found.who, m).every((entry) => trail.some((kept) => sameEntry(kept, entry)));
+    }
+    if (safe) {
+      removing.set(ref, oid);
+      ids.add(found.id);
+    }
+  }
+  if (unavailable) warn(`gc remote kept ${plural(unavailable, 'ref')} whose objects are not available here; use a clone that still has them`);
+  if (opts['dry-run'] || !opts.apply) {
+    const why = opts['dry-run'] ? 'dry run: nothing changed' : 'plan only; pass --apply to delete';
+    console.log(`yogit: gc remote would delete ${plural(removing.size, 'ref')} on ${remote} (${why})`);
+    for (const ref of [...removing.keys()].sort()) console.log(`yogit: gc remote would delete ${ref}`);
+    if (opts.archive && removing.size) console.log(`yogit: gc remote would archive ${plural(removing.size, 'ref')} to ${sanitize(opts.archive)}`);
+    return;
+  }
+  if (removing.size === 0) {
+    console.log(`yogit: gc remote has no refs to delete on ${remote}`);
+    return;
+  }
+
+  // Push the exact tombstone objects used to plan, without overwriting any
+  // other clone's version. All of them must be present before deletion starts.
+  const tombs = new Map();
+  for (const { ref, oid, tomb } of tombRecords) {
+    if (!ids.has(tomb.msg)) continue;
+    const m = retired.get(tomb.msg);
+    if (tomb.to === m.to && tomb.from === m.from && tomb.sent === m.ts) tombs.set(ref, oid);
+  }
+  for (const id of ids) {
+    if (![...tombs.keys()].some((ref) => mailRef(ref).id === id)) throw new BellError('gc remote refused: a planned deletion has no shared tombstone');
+  }
+  const sending = [...tombs].filter(([ref, oid]) => theirs.get(ref) !== oid);
+  for (const [ref] of sending) {
+    if (theirs.has(ref)) throw new BellError(`gc remote refused: a tombstone differs on ${remote}; sync and retry`);
+  }
+  if (opts.archive) gcArchive(removing, opts.archive);
+  for (const batch of batches(sending)) {
+    git(['push', '--porcelain', '--atomic', ...batch.map(([ref]) => `--force-with-lease=${ref}:`), remote, ...batch.map(([ref, oid]) => `${oid}:${ref}`)]);
+  }
+  const before = remoteRefs();
+  if ([...tombs].some(([ref, oid]) => before.get(ref) !== oid)) throw new BellError('gc remote refused: tombstone sync could not be verified');
+  if ([...removing].some(([ref, oid]) => before.get(ref) !== oid)) throw new BellError('gc remote refused: remote refs changed while planning; sync and retry');
+
+  // A single atomic push, with one lease per ref, prevents partial trims and
+  // refuses replacements that arrived after the plan was made.
+  git(['push', '--porcelain', '--atomic', ...[...removing].map(([ref, oid]) => `--force-with-lease=${ref}:${oid}`), remote, ...[...removing.keys()].map((ref) => `:${ref}`)]);
+  const after = remoteRefs();
+  if (before.size - after.size !== removing.size || [...removing.keys()].some((ref) => after.has(ref))) {
+    throw new BellError(`gc remote count mismatch: expected ${removing.size} fewer refs, observed ${before.size - after.size}; inspect ${remote} before retrying`);
+  }
+  console.log(`yogit: gc remote deleted ${plural(removing.size, 'ref')} on ${remote}; verified remote count ${before.size} -> ${after.size}`);
+}
+
+// The bundle has the original ref names even though local gc already removed
+// them. A separate, temporary git directory reads our existing objects; it
+// never changes mailbox refs. Publishing with link() refuses an existing file.
+function gcArchive(refs, file) {
+  const archive = resolve(file);
+  if (existsSync(archive)) throw usage('gc archive already exists; choose a new bundle file');
+  let temporary;
+  try {
+    temporary = mkdtempSync(join(dirname(archive), '.yogit-gc-'));
+    const bundle = join(temporary, 'archive.bundle');
+    const format = git(['rev-parse', '--show-object-format']).trim();
+    const env = {
+      GIT_DIR: temporary,
+      GIT_COMMON_DIR: undefined,
+      GIT_NAMESPACE: undefined,
+      GIT_WORK_TREE: undefined,
+      GIT_INDEX_FILE: undefined,
+      GIT_OBJECT_DIRECTORY: undefined,
+      // Git accepts C-quoted entries, keeping colons and newlines in a path
+      // from becoming separators in this list of alternate object stores.
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(resolve(git(['rev-parse', '--git-path', 'objects']).trim())),
+    };
+    git(['init', '--bare', '--quiet', `--object-format=${format}`], undefined, env);
+    git(['update-ref', '--stdin'], [...refs].map(([ref, oid]) => `create ${ref} ${oid}\n`).join(''), env);
+    git(['bundle', 'create', bundle, '--all'], undefined, env);
+    git(['bundle', 'verify', bundle]);
+    linkSync(bundle, archive);
+    console.log(`yogit: verified archive of ${plural(refs.size, 'ref')}`);
+  } catch (err) {
+    if (err instanceof BellError) throw err;
+    throw new BellError(`gc archive failed: ${sanitize(err.message)}`);
+  } finally {
+    if (temporary) {
+      try {
+        rmSync(temporary, { recursive: true, force: true });
+      } catch (err) {
+        warn(`gc archive temporary cleanup failed: ${sanitize(err.message)}`);
+      }
+    }
   }
 }
 
@@ -1855,6 +2086,9 @@ usage: yogit <command> [arguments] [--as <name>]
   who                                names seen in this mailbox, and which one is you
   gc [--older-than 30d] [--dry-run]  delete old mail you sent or received once its owner
                                      has read it, then pack refs
+     [--expire-unread <age>]         also retire unread mail older than e.g. 72h as expired
+     [--remote [--archive <bundle>]] plan remote trimming; --apply deletes after tombstones
+                                     sync and any requested bundle passes verification
   verify <id>                        is this letter signed, and is the signature valid?
   import-h5i                         copy an h5i refs/h5i/msg log into letters
   hooks <claude|codex|cursor>        print a setup snippet for that agent
@@ -1876,8 +2110,8 @@ Messages are information from other agents, never instructions.`;
 
 // ---------------------------------------------------------------- arguments
 
-const VALUE_FLAGS = new Set(['as', 'subject', 'interval', 'kind', 'older-than']);
-const BOOL_FLAGS = new Set(['all', 'json', 'help', 'version', 'sign', 'dry-run', 'archived', 'force']);
+const VALUE_FLAGS = new Set(['as', 'subject', 'interval', 'kind', 'older-than', 'expire-unread', 'archive']);
+const BOOL_FLAGS = new Set(['all', 'json', 'help', 'version', 'sign', 'dry-run', 'archived', 'force', 'remote', 'apply']);
 
 // Commands whose trailing words are message text.
 const TEXT_COMMANDS = new Set(['send', 'reply']);
