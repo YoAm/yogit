@@ -1,6 +1,6 @@
 {
-  "name": "yogit",
-  "version": "2.1.0",
+  "name": "@yoam/yogit",
+  "version": "2.2.0",
   "description": "A mailbox for coding-agent sessions (Claude Code, Codex, Cursor, humans), kept inside your git repo as refs. One file, zero dependencies. Run it as `yogit`, or as `git yogit`.",
   "type": "module",
   "bin": {
@@ -12,6 +12,9 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "node --test"
   },
