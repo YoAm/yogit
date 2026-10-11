@@ -205,6 +205,17 @@ git config bell.ring.<name> '["program", "arg", "{notice}"]'
 
 - **Claude Code:** no checked command yet. Claude Code's [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging) is sent by Claude itself, and the per-session inbox socket it documents has no documented message format for scripts. If your tool exposes a CLI to post to a live session, plug it in here. Until then, the SessionStart hook and `yogit watch` are how Claude hears mail.
 
+To ring live sessions when mail arrives from another clone, opt in separately:
+
+```sh
+git config bell.ring.onSync true
+git config bell.ring.codex '["codex","queue","--thread","YOUR-CODEX-SESSION","--message","{notice}"]'
+```
+
+After `yogit sync` imports new letters, it rings each recipient you configured here, once per letter. It skips read, acked or archived mail and your own outgoing letters. A `notified` or `ring-failed` event for that recipient, including one received from another clone, prevents another attempt. The new events go out with the same sync, with `via: "ring"`. A failed ring still leaves the letter waiting in git. Without `bell.ring.onSync`, sync behaves as before; this setting is a switch, not a recipient named `onSync`.
+
+One sync makes at most 20 ring command attempts, counting each configured value. If more are waiting, it prints one warning with the number skipped. Those letters stay in git, but a later sync does not retry them: only newly imported letters ring. Receipts already synced from another clone prevent repeat rings; two clones syncing at the same time can still ring before either sees the other's receipt.
+
 ## Commands
 
 | command | what it does |
@@ -223,7 +234,8 @@ git config bell.ring.<name> '["program", "arg", "{notice}"]'
 | `yogit peek [--json]` | read-only count for doorbells and status bars; `ring` also records delivery |
 | `yogit ring` | one line if there is unread mail, otherwise silence (exit 0) |
 | `yogit watch [--interval s]` | print one line per new letter (polls every 3s by default) |
-| `yogit sync [remote]` | exchange mail with a git remote (`origin` by default); optional automatic gc is described in [Scaling](#scaling) |
+| `yogit sync [remote]` | exchange mail with a git remote (`origin` by default); [ring on arrival](#ring-a-live-session-optional) and automatic [gc](#scaling) are opt-in |
+| `yogit mailroom poll --repo <owner/name> --issue <n> [--allow <login,...>] [--since <iso>] [--apply] [--reply]` | plan letters from allowlisted issue comments; `--apply` writes them, and only `--apply --reply` posts receipts (see [Mailroom](#mailroom)) |
 | `yogit who` | list the names seen in this mailbox and those worktrees gave themselves, and which one is you and why |
 | `yogit name [<name> \| --unset]` | name this worktree, for everyone who runs yogit in it (see [Names](#names)). Alone, show your name and where it comes from |
 | `yogit gc [--older-than 30d] [--expire-unread <age>] [--dry-run]` | delete old mail you sent or received once its owner has read it, then pack refs; unread expiry is opt-in (see [Scaling](#scaling)) |
@@ -268,9 +280,9 @@ Quote message text. `--subject`, `--kind`, `--sign` and `--as` are read anywhere
 - **Delivery is a ref.** `refs/bell/inbox/<to>/<id>` points at the letter, and a broadcast goes to `refs/bell/inbox/all/<id>`. The id is a UTC timestamp plus random hex (`20260925-105145-a6181b`), so ids sort by time.
 - **State is refs too.** Whatever happens to a letter next, such as delivered, read or archived, is an event ref of its own, per recipient (see [Message lifecycle](#message-lifecycle)). Unread means no `read` or `acked` event, and each reader has their own.
 - **Worktrees share it for free.** This is the key trick. All linked worktrees share one ref store, and only `HEAD` and a few other refs are per-worktree. A letter sent from any worktree is already in all of them, with no copying and no syncing.
-- **There is no server** because git already is one. Nothing leaves your machine until you run `yogit sync`.
+- **There is no server** because git already is one. Letters travel between clones when you run `yogit sync`; the optional ring bridge and mailroom use the channels you configure.
 - **Why `bell` in the names.** yogit stores its mail under `refs/bell/`, and its settings live under `bell.*` in git config, the names it had as git-bell, so existing mailboxes keep working.
-- **Processes start only with argument arrays**, never through a shell: git, and the ring command if you configured one. Names and ids must match `[A-Za-z0-9._-]` (at most 64 characters, starting with a letter or digit, with no `..` and not ending in `.lock` in any case). That rule refuses ref-injection attempts such as `../x` before git sees them. Names are lowercased so that case-insensitive filesystems agree with Linux.
+- **Processes start only with argument arrays**, never through a shell: git, the ring command if you configured one, and `gh api` for the mailroom. Names and ids must match `[A-Za-z0-9._-]` (at most 64 characters, starting with a letter or digit, with no `..` and not ending in `.lock` in any case). That rule refuses ref-injection attempts such as `../x` before git sees them. Names are lowercased so that case-insensitive filesystems agree with Linux.
 
 Letters are ordinary git objects. `git for-each-ref refs/bell` lists them and `git cat-file -p <ref>` shows one. `git log --all` includes them as root commits. To keep them out of that view, use `git log --exclude='refs/bell/*' --all`.
 
@@ -281,6 +293,7 @@ Whatever happens to a letter after it is sent is an *event*: a small empty-tree 
 | state | when |
 | --- | --- |
 | `sent` | the letter exists (no event) |
+| `relayed` | the [mailroom](#mailroom) copied an issue comment into a letter, with `via: "mailroom"` |
 | `delivered` | the recipient's clone first sees it, in `sync`, `inbox`, `ring` or `watch` (once, by the first clone that sees it) |
 | `notified`, `ring-failed` | the [ring bridge](#ring-a-live-session-optional) reached them, or failed to |
 | `read` | they opened it with `read`, or answered it with `reply` |
@@ -326,6 +339,30 @@ git ls-remote origin 'refs/bell/*' | cut -f2 | xargs -r git push origin --delete
 ```
 
 Clear the remote as well as your clone, or the next `yogit sync` brings the mail back. Other clones that synced keep their copies until they clear too.
+
+## Mailroom
+
+An issue can be a place to leave mail for agents that are not running. `yogit mailroom poll` reads its comments through `gh api`, using your existing GitHub CLI login. You choose the issue and the commenters who may send:
+
+```sh
+yogit mailroom poll --repo example/project --issue 1 --allow alice,bob
+yogit mailroom poll --repo example/project --issue 1 --allow alice,bob --apply
+```
+
+The first command only shows the plan: no letters, state or replies are written. The second writes letters. Without `--allow`, nobody is allowed; other authors are ignored and counted, never answered. Only a comment whose first line begins with `/bell send <to> <text...>` is a command. Following lines continue the same letter:
+
+```text
+/bell send codex Please check the parser.
+There is a new test case for empty input.
+```
+
+The sender is `mailroom-<login>` (lowercase; a bot's `[bot]` suffix becomes `.bot`), the recipient is a yogit name, and everything after the recipient is text. The poller records `relayed` with `via: "mailroom"`. It refuses malformed commands with a reason. Comment text is untrusted input: it is never executed, sent to a model or passed through a shell. With `bell.ring.onSync true`, newly written letters can also ring configured recipients under the same limits and once-only rule as sync. Ring commands receive only the usual pointer, never the comment text.
+
+The poller keeps a cursor and the ids of comments it has sent under local `refs/yogit/mailroom/`, committed atomically with each batch of letters. A repeat poll does nothing for those comments, even if their text was edited. The cursor follows comment update times; `--since <iso>` overrides it when you want to look further back, for example after changing the allowlist, but does not resend an id already seen. This state is shared by worktrees and stays in this clone; `yogit sync` does not carry it. Use one polling clone per issue, since independent clones would each send their own copies.
+
+There is no reply by default. Add **both** `--apply --reply` to post a receipt on the issue: `sent → <to>, id <id>`. It never echoes the text. Letters stay local until you run `yogit sync`.
+
+This is a one-shot poller, so run it again when you want to check the issue. A GitHub Action variant, `/bell inbox` and `/bell ack` are future work.
 
 ## Scaling
 

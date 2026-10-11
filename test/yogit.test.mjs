@@ -708,8 +708,8 @@ test('text displays cleanly: CRLF line ends, emoji at the cut', () => withSandbo
 test('no shell anywhere: git and ring commands run with argument arrays, bodies stay inert', () => withSandbox((sb) => {
   assert.match(SOURCE, /^import \{ execFileSync, spawn \} from 'node:child_process';$/m);
   assert.doesNotMatch(SOURCE, /shell\s*:|execSync|\bexec\s*\(|\bspawnSync\s*\(|child_process\.exec\b/);
-  // Exactly two places start a process: git, and the opt-in ring command.
-  assert.deepEqual(SOURCE.match(/\bexecFileSync\(.*/g), ["execFileSync('git', args, {"]);
+  // Only git, gh for the mailroom, and the opt-in ring command start a process.
+  assert.deepEqual(SOURCE.match(/\bexecFileSync\(.*/g), ["execFileSync('git', args, {", "execFileSync('gh', args, {"]);
   assert.deepEqual(SOURCE.match(/\bspawn\(.*/g), ["spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'ignore', 'pipe'], detached: GROUPS, windowsHide: true });"]);
 
   const repo = sb.repo('repo');
@@ -3091,4 +3091,412 @@ test('gc refuses a tombstone merge beyond the reader limit without deleting sour
   check('bounded');
   const mutant = scriptWith(sb, 'skip-tombstone-check', changedSource('if (!parsed || parsed.trail.length !== tomb.trail.length) {', 'if (false) {'));
   assert.throws(() => check('unbounded-mutant', mutant), assert.AssertionError, 'negative control catches a tombstone the next read cannot parse');
+}));
+
+// ---------------------------------------------------------------- opt-in arrival rings and the mailroom
+
+// Unlike recorder(), this keeps every call, so retries and bound violations
+// cannot disappear behind an overwritten file.
+function arrivalRecorder(sb) {
+  const script = join(sb.dir, 'arrival-recorder.mjs');
+  const log = join(sb.dir, 'arrival-rings.jsonl');
+  writeFileSync(script, [
+    "import { appendFileSync, readFileSync } from 'node:fs';",
+    'const [log, exit, ...args] = process.argv.slice(2);',
+    "appendFileSync(log, JSON.stringify({ args, stdin: readFileSync(0, 'utf8') }) + '\\n');",
+    'process.exit(Number(exit));',
+  ].join('\n'));
+  return {
+    argv: (exit = 0) => [process.execPath, script, log, String(exit), '{from}', '{to}', '{id}', '{notice}', '{body}'],
+    calls: () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [],
+  };
+}
+const arrivalLetter = (id, changes = {}) => ({
+  version: 1, id, ts: '2026-01-01T00:00:00.000Z', from: 'alice', to: 'codex',
+  kind: 'msg', subject: 'ARRIVAL-PRIVATE-SUBJECT', body: 'ARRIVAL-PRIVATE-BODY-937a', ...changes,
+});
+const ringEvents = (sb, repo, id, name = 'codex') => recipient(statusJson(sb, repo, id), name).timeline
+  .filter((e) => e.state === 'notified' || e.state === 'ring-failed');
+
+function arrivalClone(sb, bare, name, recording, enabled = true) {
+  sb.git(sb.dir, 'clone', '-q', bare, name);
+  const repo = join(sb.dir, name);
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(recording.argv()));
+  if (enabled) sb.git(repo, 'config', 'bell.ring.onSync', 'true');
+  return repo;
+}
+
+test('ring on arrival: one pointer per letter, with a shared event preventing a second sync or clone from ringing again', () => withSandbox((sb) => {
+  const { bare, a, b } = hubAndClones(sb);
+  const rec = arrivalRecorder(sb);
+  const m = arrivalLetter('arrival-once');
+  plant(sb, a, m);
+  ok(sb.bell(a, ['sync', '--as', 'alice']), 'sender sync');
+  sb.git(b, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+  sb.git(b, 'config', 'bell.ring.onSync', 'true');
+  const c = arrivalClone(sb, bare, 'c', rec);
+  ok(sb.bell(b, ['sync', '--as', 'codex']), 'arrival sync');
+  assert.deepEqual(rec.calls(), [{ args: ['alice', 'codex', m.id, NOTICE('alice'), '{body}'], stdin: '' }]);
+  assert.ok(!JSON.stringify(rec.calls()).includes(m.body), 'the letter text never reaches ring argv or stdin');
+  assert.ok(!JSON.stringify(rec.calls()).includes(m.subject), 'nor does its subject');
+  assert.deepEqual(ringEvents(sb, b, m.id).map((e) => [e.state, e.via]), [['notified', 'ring']]);
+  assert.equal(ringEvents(sb, bare, m.id).length, 1, 'the event is pushed in the same sync');
+  ok(sb.bell(b, ['sync', '--as', 'codex']), 'repeat sync');
+  ok(sb.bell(c, ['sync', '--as', 'codex']), 'second clone sync');
+  assert.equal(rec.calls().length, 1, 'even a clone first importing this letter sees the prior ring');
+  assert.equal(ringEvents(sb, c, m.id).length, 1);
+}));
+
+test('ring on arrival: defaults and false stay silent, and enabling it does not ring old mail', () => withSandbox((sb) => {
+  const { a, b } = hubAndClones(sb);
+  const rec = arrivalRecorder(sb);
+  sb.git(b, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+  for (const [id, setting] of [['arrival-default', null], ['arrival-false', 'false'], ['arrival-enabled', 'true']]) {
+    if (setting !== null) sb.git(b, 'config', 'bell.ring.onSync', setting);
+    plant(sb, a, arrivalLetter(id));
+    ok(sb.bell(a, ['sync', '--as', 'alice']), 'sender sync');
+    ok(sb.bell(b, ['sync', '--as', 'codex']), 'recipient sync');
+    assert.equal(rec.calls().length, setting === 'true' ? 1 : 0, `onSync=${setting}`);
+  }
+  assert.equal(rec.calls()[0].args[2], 'arrival-enabled', 'only newly imported mail rings');
+}));
+
+test('ring on arrival: imported read, acked, archived, notified and failed mail, and my outgoing mail, stay silent', () => withSandbox((sb) => {
+  const { a, b } = hubAndClones(sb);
+  const rec = arrivalRecorder(sb);
+  const t = '2026-01-02T00:00:00.000Z';
+  for (const state of ['read', 'acked', 'archived', 'notified', 'ring-failed']) {
+    const m = arrivalLetter(`arrival-${state}`);
+    plant(sb, a, m, { acks: state === 'acked' ? ['codex'] : [] });
+    plantEvent(sb, a, { msg: m.id, to: 'codex', state, ts: t, actor: 'codex', via: state === 'notified' || state === 'ring-failed' ? 'ring' : 'local' }, `arrival-${state}-event`);
+    if (state === 'notified' || state === 'ring-failed') {
+      plantEvent(sb, a, { msg: m.id, to: 'codex', state: 'delivered', ts: '2026-01-03T00:00:00.000Z', actor: 'codex', via: 'sync' }, `arrival-${state}-delivered`);
+    }
+  }
+  for (const m of [
+    arrivalLetter('arrival-outgoing', { from: 'codex', to: 'bob' }),
+    arrivalLetter('arrival-no-target', { to: 'nobody' }),
+    arrivalLetter('arrival-fresh'),
+    arrivalLetter('arrival-other-recipient', { to: 'bob' }),
+  ]) plant(sb, a, m);
+  ok(sb.bell(a, ['sync', '--as', 'alice']), 'sender sync');
+  for (const name of ['codex', 'bob']) sb.git(b, 'config', `bell.ring.${name}`, JSON.stringify(rec.argv()));
+  sb.git(b, 'config', 'bell.ring.onSync', 'true');
+  ok(sb.bell(b, ['sync', '--as', 'codex']), 'recipient sync');
+  assert.deepEqual(rec.calls().map((c) => c.args[2]).sort(), ['arrival-fresh', 'arrival-other-recipient'], 'the unread controls ring for each locally configured recipient');
+}));
+
+test('ring on arrival: a failed ring warns, keeps the letter unread, and is never retried in another clone', () => withSandbox((sb) => {
+  const { bare, a, b } = hubAndClones(sb);
+  const rec = arrivalRecorder(sb);
+  const m = arrivalLetter('arrival-failed');
+  plant(sb, a, m);
+  ok(sb.bell(a, ['sync', '--as', 'alice']), 'sender sync');
+  sb.git(b, 'config', 'bell.ring.codex', JSON.stringify(rec.argv(3)));
+  sb.git(b, 'config', 'bell.ring.onSync', 'true');
+  const first = ok(sb.bell(b, ['sync', '--as', 'codex']), 'failing ring sync');
+  assert.match(first.err, /could not ring codex.*exit status 3/);
+  assert.equal(inboxJson(sb, b, 'codex').messages[0].body, m.body, 'the letter still waits');
+  assert.deepEqual(ringEvents(sb, b, m.id).map((e) => [e.state, e.via]), [['ring-failed', 'ring']]);
+  ok(sb.bell(b, ['sync', '--as', 'codex']), 'repeat failed sync');
+  const c = arrivalClone(sb, bare, 'failure-copy', rec);
+  ok(sb.bell(c, ['sync', '--as', 'codex']), 'failure second clone');
+  assert.equal(rec.calls().length, 1, 'failure is remembered just like success');
+}));
+
+test('ring on arrival: broadcasts deduplicate per recipient, and onSync is never a ring target', () => withSandbox((sb) => {
+  const { a, b } = hubAndClones(sb);
+  const rec = arrivalRecorder(sb);
+  const m = arrivalLetter('arrival-broadcast', { to: 'all' });
+  plant(sb, a, m);
+  plantEvent(sb, a, { msg: m.id, to: 'codex', state: 'notified', ts: m.ts, actor: 'alice', via: 'ring' }, 'codex-already-notified');
+  ok(sb.bell(a, ['sync', '--as', 'alice']), 'broadcast sender sync');
+  for (const name of ['alice', 'bob', 'codex']) sb.git(b, 'config', `bell.ring.${name}`, JSON.stringify(rec.argv()));
+  sb.git(b, 'config', 'bell.ring.onSync', 'true');
+  const received = ok(sb.bell(b, ['sync', '--as', 'codex']), 'broadcast arrival');
+  assert.equal(received.err, '', 'the boolean setting is not parsed as a ring command');
+  assert.equal(rec.calls().length, 1, 'only bob is still eligible');
+  assert.equal(ringEvents(sb, b, m.id, 'bob').length, 1);
+  assert.equal(ringEvents(sb, b, m.id, 'codex').length, 1);
+  assert.ok(!statusJson(sb, b, m.id).recipients.some((r) => r.name === 'onsync'));
+}));
+
+function checkArrivalBound(sb, script = YOGIT) {
+  const { a, b } = hubAndClones(sb);
+  const rec = arrivalRecorder(sb);
+  for (let i = 0; i < 23; i += 1) plant(sb, a, arrivalLetter(`arrival-bound-${String(i).padStart(2, '0')}`));
+  ok(sb.bell(a, ['sync', '--as', 'alice']), 'bound sender sync');
+  sb.git(b, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+  sb.git(b, 'config', 'bell.ring.onSync', 'true');
+  const r = ok(sb.bell(b, ['sync', '--as', 'codex'], { script }), 'bounded arrival');
+  assert.equal(rec.calls().length, 20, 'the maximum is twenty ring commands');
+  assert.equal(r.err.trim().split('\n').length, 1, 'one summary warning');
+  assert.match(r.err, /ring on arrival.*3.*limit of 20/);
+  assert.equal(inboxJson(sb, b, 'codex').messages.length, 23, 'the bound never loses mail');
+  ok(sb.bell(b, ['sync', '--as', 'codex'], { script }), 'bounded repeat');
+  assert.equal(rec.calls().length, 20, 'a repeat sync does not ring previously imported mail');
+}
+test('ring on arrival: twenty-command bound holds; raising it fails the negative control', async () => {
+  await withSandbox((sb) => checkArrivalBound(sb));
+  await withSandbox((sb) => {
+    const mutant = scriptWith(sb, 'raised-arrival-limit', changedSource('const ARRIVAL_RING_LIMIT = 20;', 'const ARRIVAL_RING_LIMIT = 21;'));
+    assert.throws(() => checkArrivalBound(sb, mutant), assert.AssertionError, 'negative control catches a twenty-first ring');
+  });
+});
+
+// A local gh executable handles only API comments. Any unexpected operation
+// fails, and every argv and POST body is recorded outside the repository.
+function mailroomGh(sb) {
+  const bin = join(sb.dir, 'gh-bin');
+  mkdirSync(bin);
+  const input = join(sb.dir, 'issue-comments.json');
+  const log = join(sb.dir, 'gh-calls.jsonl');
+  writeFileSync(input, '[]');
+  writeFileSync(join(bin, 'gh'), `#!${process.execPath}
+const { appendFileSync, readFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const methodAt = args.findIndex((x) => x === '--method' || x === '-X');
+const method = methodAt < 0 ? 'GET' : args[methodAt + 1];
+const stdin = method === 'POST' ? readFileSync(0, 'utf8') : '';
+appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, stdin }) + '\\n');
+if (args[0] !== 'api' || !args.some((x) => /^repos\\/example\\/mailbox\\/issues\\/7\\/comments(?:\\?|$)/.test(x))) process.exit(8);
+if (method === 'POST') { process.stdout.write('{}'); process.exit(0); }
+if (method !== 'GET') process.exit(9);
+const all = JSON.parse(readFileSync(${JSON.stringify(input)}, 'utf8'));
+const endpoint = args.find((x) => x.startsWith('repos/'));
+const page = Number(/(?:[?&])page=(\\d+)/.exec(endpoint)?.[1] || '1');
+process.stdout.write(JSON.stringify(all.slice((page - 1) * 100, page * 100)));
+`, { mode: 0o755 });
+  return {
+    env: { PATH: `${bin}${delimiter}${process.env.PATH}` },
+    comments: (comments) => writeFileSync(input, JSON.stringify(comments)),
+    calls: () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [],
+  };
+}
+const issueComment = (id, login, body, changes = {}) => ({
+  id, user: { login }, body, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', ...changes,
+});
+const pollArgs = (...extra) => ['mailroom', 'poll', '--repo', 'example/mailbox', '--issue', '7', ...extra];
+const postCalls = (gh) => gh.calls().filter((c) => c.args.includes('POST'));
+function gitContents(repo) {
+  const contents = [];
+  const walk = (dir, prefix = '') => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const name = `${prefix}${entry.name}`;
+      if (entry.isDirectory()) walk(join(dir, entry.name), `${name}/`);
+      else contents.push([name, readFileSync(join(dir, entry.name)).toString('base64')]);
+    }
+  };
+  walk(join(repo, '.git'));
+  return contents;
+}
+
+test('mailroom: plan writes nothing, an allowlisted multiline send is relayed once, and the default never replies', { skip: process.platform === 'win32' && 'gh fixture uses a POSIX executable' }, () => withSandbox((sb) => {
+  const repo = sb.repo('mailroom');
+  const gh = mailroomGh(sb);
+  const body = 'MAILROOM-PRIVATE-BODY-a2f9\nsecond line\n/bell send bob this is still letter text';
+  gh.comments([
+    issueComment(101, 'Alice', `/bell send codex ${body}`),
+    issueComment(102, 'mallory', '/bell send codex disallowed text'),
+  ]);
+  const before = gitContents(repo);
+  const plan = ok(sb.bell(repo, pollArgs('--allow', 'ALICE', '--reply'), { env: gh.env }), 'mailroom plan');
+  assert.match(plan.out, /1 would send/);
+  assert.match(plan.out, /1 ignored/);
+  assert.deepEqual(gitContents(repo), before, 'plan writes neither letters, objects, refs, config nor cursor state');
+  assert.equal(postCalls(gh).length, 0, '--reply still needs --apply');
+  const applied = ok(sb.bell(repo, pollArgs('--allow', 'ALICE', '--apply'), { env: gh.env }), 'mailroom apply');
+  assert.match(applied.out, /1 sent/);
+  assert.match(applied.out, /1 ignored/);
+  const [m] = inboxJson(sb, repo, 'codex').messages;
+  assert.ok(m, 'the allowlisted command made a letter');
+  assert.equal(inboxJson(sb, repo, 'codex').messages.length, 1, 'the unlisted author made no letter');
+  assert.equal(m.from, 'mailroom-alice');
+  assert.equal(m.body, body, 'following lines are text, never another command');
+  assert.deepEqual(recipient(statusJson(sb, repo, m.id), 'codex').timeline.filter((e) => e.state === 'relayed').map((e) => e.via), ['mailroom']);
+  assert.equal(postCalls(gh).length, 0, '--apply alone never posts');
+  const settled = sb.git(repo, 'for-each-ref');
+  gh.comments([issueComment(101, 'Alice', '/bell send codex edited after delivery')]);
+  const again = ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply', '--reply'), { env: gh.env }), 'mailroom rerun');
+  assert.match(again.out, /0 sent/);
+  assert.equal(sb.git(repo, 'for-each-ref'), settled, 'a seen comment id stays seen even after an edit');
+  assert.equal(inboxJson(sb, repo, 'codex').messages[0].body, body);
+  assert.equal(postCalls(gh).length, 0, 'rerunning with --reply cannot answer an old comment');
+}));
+
+test('mailroom: absent allowlist denies everyone, malformed commands give reasons, and noncommands stay inert', { skip: process.platform === 'win32' && 'gh fixture uses a POSIX executable' }, () => withSandbox((sb) => {
+  const repo = sb.repo('mailroom');
+  const gh = mailroomGh(sb);
+  gh.comments([issueComment(201, 'alice', '/bell send codex please review')]);
+  const denied = ok(sb.bell(repo, pollArgs('--apply', '--reply'), { env: gh.env }), 'no allowlist');
+  assert.match(denied.out, /1 ignored/);
+  assert.equal(sb.refs(repo).length, 0);
+  assert.equal(postCalls(gh).length, 0);
+  gh.comments([
+    issueComment(202, 'alice', '/bell send codex'),
+    issueComment(203, 'alice', '/bell send ../codex do not deliver'),
+    issueComment(204, 'alice', 'not a command\n/bell send codex still not a command'),
+    issueComment(205, 'mallory', '/bell send'),
+  ]);
+  const invalid = ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply', '--reply'), { env: gh.env }), 'malformed mailroom commands');
+  assert.match(invalid.out + invalid.err, /comment 202 refused: .*(?:text|body|usage|send)/i);
+  assert.match(invalid.out + invalid.err, /comment 203 refused: .*(?:recipient|name)/i);
+  assert.doesNotMatch(invalid.out + invalid.err, /comment 205 refused/, 'an unlisted commenter is silently ignored, even if malformed');
+  assert.equal(sb.refs(repo).length, 0, 'no malformed or embedded command creates mail');
+  assert.equal(postCalls(gh).length, 0, 'refusals and ignored comments are never answered');
+}));
+
+test('mailroom: explicit receipts contain only recipient and id, and arrival rings never expose or execute comment text', { skip: process.platform === 'win32' && 'gh fixture uses a POSIX executable' }, () => withSandbox((sb) => {
+  const repo = sb.repo('mailroom');
+  const gh = mailroomGh(sb);
+  const rec = arrivalRecorder(sb);
+  const canary = join(sb.dir, 'comment-executed');
+  const body = `MAILROOM-SECRET-4db8 $(touch ${canary}) \`touch ${canary}\` ; touch ${canary}\n--apply --reply`;
+  gh.comments([issueComment(301, 'alice', `/bell send codex ${body}`), issueComment(302, 'mallory', '/bell send codex PRIVATE-DENIED')]);
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+  sb.git(repo, 'config', 'bell.ring.onSync', 'true');
+  ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply', '--reply'), { env: gh.env }), 'mailroom receipt');
+  const [m] = inboxJson(sb, repo, 'codex').messages;
+  assert.equal(m.body, body);
+  assert.equal(existsSync(canary), false, 'command substitution and following lines are inert text');
+  assert.deepEqual(postCalls(gh).map((c) => JSON.parse(c.stdin)), [{ body: `sent → codex, id ${m.id}` }]);
+  assert.ok(!JSON.stringify(gh.calls()).includes('MAILROOM-SECRET-4db8'), 'the text never enters gh argv or the receipt body');
+  assert.ok(!JSON.stringify(gh.calls()).includes('PRIVATE-DENIED'), 'ignored text never enters a reply');
+  assert.deepEqual(rec.calls(), [{ args: ['mailroom-alice', 'codex', m.id, NOTICE('mailroom-alice'), '{body}'], stdin: '' }]);
+  assert.ok(!JSON.stringify(rec.calls()).includes('MAILROOM-SECRET-4db8'), 'ring argv never carries the comment text');
+  assert.deepEqual(ringEvents(sb, repo, m.id).map((e) => [e.state, e.via]), [['notified', 'ring']]);
+  ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply', '--reply'), { env: gh.env }), 'receipt rerun');
+  assert.equal(postCalls(gh).length, 1);
+  assert.equal(rec.calls().length, 1);
+}));
+
+test('mailroom: API pagination and a timestamp cursor keep distinct comment ids at the same time', { skip: process.platform === 'win32' && 'gh fixture uses a POSIX executable' }, () => withSandbox((sb) => {
+  const repo = sb.repo('mailroom');
+  const gh = mailroomGh(sb);
+  const since = '2026-01-01T00:00:00Z';
+  gh.comments([
+    ...Array.from({ length: 99 }, (_, i) => issueComment(400 + i, 'mallory', 'ordinary comment')),
+    issueComment(499, 'alice', '/bell send codex predates the requested window', { updated_at: '2025-12-31T23:59:59Z' }),
+    issueComment(500, 'alice', '/bell send codex first allowed comment'),
+    issueComment(501, 'alice', '/bell send codex same timestamp, different id'),
+  ]);
+  ok(sb.bell(repo, pollArgs('--allow', 'alice', '--since', since, '--apply'), { env: gh.env }), 'paginated mailroom');
+  assert.equal(inboxJson(sb, repo, 'codex').messages.length, 2);
+  assert.ok(gh.calls().some((c) => c.args.some((arg) => arg.includes('page=2'))), 'the second API page was fetched');
+  const overlap = new Date(Date.parse(since) - 1000).toISOString();
+  assert.ok(gh.calls().some((c) => c.args.some((arg) => decodeURIComponent(arg).includes(`since=${overlap}`))), '--since revisits the boundary second, while the older allowed comment is filtered locally');
+  ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply'), { env: gh.env }), 'cursor mailroom');
+  assert.equal(inboxJson(sb, repo, 'codex').messages.length, 2, 'seen ids survive an inclusive cursor boundary');
+  assert.equal(postCalls(gh).length, 0);
+}));
+
+for (const [label, from, to, check] of [
+  ['default-off', "if (!configTrue('bell.ring.onSync')) return;", '// arrival config guard deliberately removed', (sb, script) => {
+    const { a, b } = hubAndClones(sb);
+    const rec = arrivalRecorder(sb);
+    plant(sb, a, arrivalLetter('default-control'));
+    ok(sb.bell(a, ['sync', '--as', 'alice']), 'default control fixture');
+    sb.git(b, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+    ok(sb.bell(b, ['sync', '--as', 'codex'], { script }), 'default control sync');
+    assert.equal(rec.calls().length, 0, 'a configured command does not opt sync into ringing');
+  }],
+  ['shared-attempt', 'return !f.timeline.some((e) => e.state === STATES.NOTIFIED || e.state === STATES.RING_FAILED);', 'return true;', (sb, script) => {
+    const { a, b } = hubAndClones(sb);
+    const rec = arrivalRecorder(sb);
+    for (const id of ['already-rang', 'not-yet-rang']) plant(sb, a, arrivalLetter(id));
+    plantEvent(sb, a, { msg: 'already-rang', to: 'codex', state: 'notified', ts: '2026-01-02T00:00:00Z', actor: 'alice', via: 'ring' }, 'prior-ring');
+    ok(sb.bell(a, ['sync', '--as', 'alice']), 'shared attempt fixture');
+    sb.git(b, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+    sb.git(b, 'config', 'bell.ring.onSync', 'true');
+    ok(sb.bell(b, ['sync', '--as', 'codex'], { script }), 'shared attempt control');
+    assert.deepEqual(rec.calls().map((c) => c.args[2]), ['not-yet-rang'], 'a shared ring event suppresses only that letter');
+  }],
+]) test(`ring on arrival: ${label} safety check fails when its guard is removed`, async () => {
+  await withSandbox((sb) => check(sb, YOGIT));
+  await withSandbox((sb) => {
+    const mutant = scriptWith(sb, label, changedSource(from, to));
+    assert.throws(() => check(sb, mutant), assert.AssertionError, `negative control catches missing ${label} guard`);
+  });
+});
+
+for (const [label, from, to, check] of [
+  ['plan-only', 'if (!opts.apply) break;', '// plan guard deliberately removed', (sb, repo, gh, script) => {
+    const before = gitContents(repo);
+    ok(sb.bell(repo, pollArgs('--allow', 'alice'), { env: gh.env, script }), 'plan control');
+    assert.deepEqual(gitContents(repo), before, 'a plan cannot write mailroom state or letters');
+  }],
+  ['allowlist', 'if (!ctx.allow.has(login)) { ignored += 1; continue; }', '// allowlist deliberately bypassed', (sb, repo, gh, script) => {
+    ok(sb.bell(repo, pollArgs('--apply', '--reply'), { env: gh.env, script }), 'allowlist control');
+    assert.equal(sb.refs(repo).length, 0, 'no allowlist means no allowed sender');
+    assert.equal(postCalls(gh).length, 0, 'an unlisted commenter is never answered');
+  }],
+  ['seen-id', 'if (encountered.has(id)) { already += 1; continue; }', '// seen-id guard deliberately bypassed', (sb, repo, gh, script) => {
+    ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply'), { env: gh.env, script }), 'seen control first run');
+    ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply'), { env: gh.env, script }), 'seen control second run');
+    assert.equal(inboxJson(sb, repo, 'codex').messages.length, 1, 'a comment id produces exactly one letter');
+  }],
+  ['pointer-receipt', 'JSON.stringify({ body: `sent → ${msg.to}, id ${msg.id}` })', 'JSON.stringify({ body: msg.body })', (sb, repo, gh, script) => {
+    ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply', '--reply'), { env: gh.env, script }), 'receipt control');
+    const [m] = inboxJson(sb, repo, 'codex').messages;
+    assert.deepEqual(postCalls(gh).map((c) => JSON.parse(c.stdin)), [{ body: `sent → codex, id ${m.id}` }], 'a receipt contains no letter text');
+  }],
+]) test(`mailroom: ${label} safety check fails when its guard is removed`, { skip: process.platform === 'win32' && 'gh fixture uses a POSIX executable' }, async () => {
+  const fixture = (sb, script) => {
+    const repo = sb.repo('mailroom');
+    const gh = mailroomGh(sb);
+    gh.comments([issueComment(601, 'alice', '/bell send codex MUTATION-PRIVATE-BODY')]);
+    check(sb, repo, gh, script);
+  };
+  await withSandbox((sb) => fixture(sb, YOGIT));
+  await withSandbox((sb) => {
+    const mutant = scriptWith(sb, label, changedSource(from, to));
+    assert.throws(() => fixture(sb, mutant), assert.AssertionError, `negative control catches missing ${label} protection`);
+  });
+});
+
+test('mailroom: a refused refs transaction saves neither letter nor seen id, and a retry can deliver it', { skip: process.platform === 'win32' && 'git and gh fixtures use POSIX executables' }, () => withSandbox((sb) => {
+  const repo = sb.repo('mailroom');
+  const gh = mailroomGh(sb);
+  const realGit = process.env.PATH.split(delimiter).map((p) => join(p, 'git')).find(existsSync);
+  assert.ok(realGit);
+  const bin = join(sb.dir, 'reject-git-bin');
+  const log = join(sb.dir, 'mailroom-transaction.txt');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { readFileSync, writeFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const input = readFileSync(0, 'utf8');
+if (args[0] === 'update-ref' && args.includes('--stdin') && input.includes('refs/yogit/mailroom/')) {
+  writeFileSync(${JSON.stringify(log)}, input);
+  process.stderr.write('injected refs transaction failure\\n'); process.exit(1);
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, { input, encoding: 'utf8' });
+process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
+process.exit(result.status === null ? 1 : result.status);
+`, { mode: 0o755 });
+  gh.comments([issueComment(701, 'alice', '/bell send codex retry after a failed write')]);
+  const rejected = sb.bell(repo, pollArgs('--allow', 'alice', '--apply', '--reply'), { env: { PATH: `${bin}${delimiter}${gh.env.PATH}` } });
+  assert.notEqual(rejected.code, 0, 'failure is reported');
+  assert.match(rejected.err, /injected refs transaction failure/);
+  assert.match(readFileSync(log, 'utf8'), /create refs\/bell\/inbox\/codex\//);
+  assert.match(readFileSync(log, 'utf8'), /create refs\/bell\/event\/codex\/.*-relayed-/);
+  assert.match(readFileSync(log, 'utf8'), /create refs\/yogit\/mailroom\//, 'letter, relayed event and seen state share one transaction');
+  assert.equal(sb.git(repo, 'for-each-ref'), '', 'a refused transaction advances nothing');
+  assert.equal(postCalls(gh).length, 0);
+  ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply'), { env: gh.env }), 'retry after transaction refusal');
+  assert.equal(inboxJson(sb, repo, 'codex').messages.length, 1, 'the comment was not marked seen prematurely');
+}));
+
+test('mailroom: an unavailable syncing identity never undoes a successful import', { skip: process.platform === 'win32' && 'gh fixture uses a POSIX executable' }, () => withSandbox((sb) => {
+  const repo = sb.repo('mailroom');
+  const gh = mailroomGh(sb);
+  const rec = arrivalRecorder(sb);
+  gh.comments([issueComment(801, 'alice', '/bell send codex independent of local identity')]);
+  sb.git(repo, 'config', 'bell.name', '../invalid-name');
+  sb.git(repo, 'config', 'bell.ring.onSync', 'true');
+  sb.git(repo, 'config', 'bell.ring.codex', JSON.stringify(rec.argv()));
+  ok(sb.bell(repo, pollArgs('--allow', 'alice', '--apply'), { env: gh.env }), 'mailroom without a usable identity');
+  assert.equal(inboxJson(sb, repo, 'codex').messages.length, 1);
+  assert.equal(rec.calls().length, 1, 'a configured recipient can still be rung');
 }));
