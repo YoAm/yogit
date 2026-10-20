@@ -132,3 +132,11 @@ Read `scripts/runner/setup-yogit-security-runner.sh` and run it as root on a
 private host. It does **not** start the service and does **not** provision
 the token. The host needs `git`, `curl`, and Python 3 for the scanner's
 plugin runtime. `actions/setup-node` installs Node.
+
+## One-shot provisioning
+
+`REG_TOKEN_FILE=<0600 file> PROVISION_ACCESS_TOKEN=1` lets the setup script take
+the runner registration token from a file (deleted after use) and prompt once,
+hidden, for the ChatGPT access token, then start the unit. This is the path used
+for the first registration (persistent, `EPHEMERAL=0`, because the ephemeral
+re-registration loop is out of scope).
