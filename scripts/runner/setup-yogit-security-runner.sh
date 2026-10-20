@@ -34,6 +34,9 @@
 #   way, so persistent is acceptable for a single-repo, same-repo-PR-only
 #   runner; see the runbook's threat model before choosing.
 set -euo pipefail
+# runuser children inherit the caller's cwd; a cwd the runner user cannot
+# resolve (e.g. the maintainer's 0700 home) makes npm die with uv_cwd ENOENT.
+cd /
 
 REPO_URL="${REPO_URL:-https://github.com/YoAm/yogit}"
 RUNNER_USER="${RUNNER_USER:-yogit-security}"
