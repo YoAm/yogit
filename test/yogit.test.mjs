@@ -1598,14 +1598,28 @@ test('init leaves hooks it did not write alone, keeps 4-space and tab files byte
   assert.match(init(['claude']).out, /whitespace/);
 
   // (h) A symlinked settings file stays a symlink; its target gets the entry.
+  // A link that leads out of the worktree is refused unless --follow-links says so.
   rmSync(local);
   mkdirSync(join(sb.dir, 'dotfiles'));
   const target = join(sb.dir, 'dotfiles', 'claude-local.json');
   writeFileSync(target, '{}\n');
   symlinkSync(target, local);
-  assert.equal(init(['claude', '--yes']).code, 0);
+  const refused = init(['claude', '--yes']);
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /leads outside this worktree through a symlink.*--follow-links/);
+  assert.equal(readFileSync(target, 'utf8'), '{}\n', 'the file outside the worktree is untouched');
+  assert.equal(init(['claude', '--yes', '--follow-links']).code, 0);
   assert.equal(readlinkSync(local), target);
   assert.deepEqual(readJson(target).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
+  // A link that stays inside the worktree is followed as before.
+  rmSync(local);
+  rmSync(target);
+  const inside = join(repo, 'kept-settings.json');
+  writeFileSync(inside, '{}\n');
+  symlinkSync(inside, local);
+  assert.equal(init(['claude', '--yes']).code, 0);
+  assert.equal(readlinkSync(local), inside);
+  assert.deepEqual(readJson(inside).hooks.SessionStart, [hookGroup(sb, initCommand(sb, bin))]);
 }));
 
 test('init refuses a settings file that is not strict JSON, prints the fragment instead, and still does the rest', () => withSandbox((sb) => {
@@ -3091,4 +3105,67 @@ test('gc refuses a tombstone merge beyond the reader limit without deleting sour
   check('bounded');
   const mutant = scriptWith(sb, 'skip-tombstone-check', changedSource('if (!parsed || parsed.trail.length !== tomb.trail.length) {', 'if (false) {'));
   assert.throws(() => check('unbounded-mutant', mutant), assert.AssertionError, 'negative control catches a tombstone the next read cannot parse');
+}));
+
+test('JSON output escapes bidi and C1 controls, and parses back to the same text', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  const text = 'plain ‮evil‬ ⁦x⁩ ‏ ؜ \u0085 end';
+  sentId(sb.bell(repo, ['send', 'codex', text, '--subject', `s‮1`, '--as', 'claude']));
+  for (const [args, pick] of [
+    [['inbox', '--json', '--as', 'codex'], (j) => j.messages[0]],
+    [['outbox', '--json', '--as', 'claude'], (j) => j.messages[0]],
+  ]) {
+    const r = sb.bell(repo, args);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(!/[\u0085؜‏‪-‮⁦-⁩]/.test(r.out), `raw control in ${args[0]} --json`);
+    assert.match(r.out, /\\u202e/);
+    assert.equal(pick(JSON.parse(r.out)).subject, 's‮1');
+  }
+  assert.equal(inboxJson(sb, repo, 'codex').messages[0].body, text);
+}));
+
+test('mail reads are bounded: refs over YOGIT_MAX_REFS and bytes over YOGIT_MAX_MAIL_BYTES are left unread, the rest still loads', () => withSandbox((sb) => {
+  const repo = sb.repo('repo');
+  for (const n of [1, 2, 3]) sentId(sb.bell(repo, ['send', 'codex', `letter ${n}`, '--as', 'claude']));
+  const capped = sb.bell(repo, ['inbox', '--json', '--as', 'codex'], { env: { YOGIT_MAX_REFS: '2' } });
+  assert.equal(capped.code, 0, capped.err);
+  assert.equal(JSON.parse(capped.out).messages.length, 2);
+  assert.match(capped.err, /YOGIT_MAX_REFS/);
+
+  const one = sb.git(repo, 'cat-file', '-s', sb.refs(repo, 'refs/bell/inbox')[0]);
+  const budget = sb.bell(repo, ['inbox', '--json', '--as', 'codex'], { env: { YOGIT_MAX_MAIL_BYTES: one } });
+  assert.equal(budget.code, 0, budget.err);
+  assert.equal(JSON.parse(budget.out).messages.length, 1);
+  assert.match(budget.err, /YOGIT_MAX_MAIL_BYTES/);
+
+  // A commit far larger than any mail record is never read; the rest loads.
+  const tree = sb.git(repo, 'hash-object', '-t', 'tree', '-w', '--stdin');
+  const huge = `tree ${tree}\nauthor x <x@bell> 0 +0000\ncommitter x <x@bell> 0 +0000\n\n${'a'.repeat(2 * 1024 * 1024)}\n`;
+  sb.git(repo, 'update-ref', 'refs/bell/inbox/codex/huge', sb.gitWith(repo, ['hash-object', '-t', 'commit', '-w', '--stdin'], { input: huge }));
+  const r = sb.bell(repo, ['inbox', '--json', '--as', 'codex']);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(JSON.parse(r.out).messages.length, 3);
+}));
+
+test('sync takes only mail-shaped commits: a ref with history or files is not fetched, and its objects never land here', () => withSandbox((sb) => {
+  const { bare, a, b } = hubAndClones(sb);
+  const id = sentId(sb.bell(a, ['send', 'codex', 'real mail', '--as', 'claude']));
+  assert.equal(sb.bell(a, ['sync', '--as', 'claude']).code, 0);
+  const letter = sb.git(bare, 'rev-parse', `refs/bell/inbox/codex/${id}`);
+  const blob = sb.gitWith(bare, ['hash-object', '-w', '--stdin'], { input: 'a file that is not mail\n' });
+  const tree = sb.gitWith(bare, ['mktree'], { input: `100644 blob ${blob}\tpayload\n` });
+  const withFiles = sb.gitWith(bare, ['commit-tree', tree, '-m', '{}'], { env: IDENT });
+  const withParent = sb.gitWith(bare, ['commit-tree', EMPTY_TREE, '-p', letter, '-m', '{}'], { env: IDENT });
+  sb.git(bare, 'update-ref', 'refs/bell/inbox/codex/files1', withFiles);
+  sb.git(bare, 'update-ref', 'refs/bell/inbox/codex/parent1', withParent);
+
+  const r = sb.bell(b, ['sync', '--as', 'codex']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /received 1 message/);
+  assert.match(r.err, /did not take 2 refs from origin/);
+  assert.deepEqual(sb.refs(b, 'refs/bell/inbox'), [`refs/bell/inbox/codex/${id}`]);
+  for (const oid of [blob, tree, withFiles, withParent]) {
+    assert.notEqual(spawnSync('git', ['cat-file', '-e', oid], { cwd: b, env: sb.baseEnv }).status, 0, `${oid} stayed out`);
+  }
+  assert.equal(inboxJson(sb, b, 'codex').messages[0].body, 'real mail');
 }));
