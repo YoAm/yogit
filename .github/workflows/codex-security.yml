@@ -1,0 +1,150 @@
+# Advisory Codex Security diff scan on a PRIVATE self-hosted runner.
+#
+# yogit is a public repository: everything this job prints (logs, step
+# summary) is public. Findings therefore never leave the runner; only
+# per-severity counts are written to the step summary. See
+# docs/codex-security-ci.md for the threat model, token lifecycle and kill
+# switch.
+#
+# Inert until a runner labelled `yogit-security` is registered and its
+# token file is provisioned; until then queued jobs wait for a runner.
+name: Codex Security
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Codex Security diff scan (advisory)
+    # Same-repository PRs only: fork PRs must never reach the self-hosted
+    # runner or the maintainer's ChatGPT credential.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, yogit-security]
+    timeout-minutes: 60
+    continue-on-error: true
+    env:
+      CODEX_SECURITY_VERSION: 0.5.0
+      CI: 'true'
+      NO_COLOR: '1'
+      CODEX_SECURITY_NO_UPDATE_NOTICE: '1'
+    steps:
+      - name: Check out
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Prepare private state outside the workspace
+        id: state
+        run: |
+          set -euo pipefail
+          umask 077
+          state="$(mktemp -d "${RUNNER_TEMP:?}/codex-security.XXXXXXXX")"
+          chmod 700 "$state"
+          mkdir -m 700 "$state/state" "$state/codex-home" "$state/results" "$state/tool"
+          case "$state" in "${GITHUB_WORKSPACE:?}"/*) echo "state dir inside workspace" >&2; exit 2 ;; esac
+          echo "dir=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Install codex-security (no install scripts)
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          npm install --prefix "$STATE/tool" --no-save --no-audit --no-fund \
+            --ignore-scripts "@openai/codex-security@${CODEX_SECURITY_VERSION}"
+          "$STATE/tool/node_modules/.bin/codex-security" --version
+
+      - name: Sign in from the runner-local access-token file
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          token_file="${CODEX_SECURITY_TOKEN_FILE:?CODEX_SECURITY_TOKEN_FILE is not set in the runner service environment}"
+          [ -f "$token_file" ] || { echo "token file missing" >&2; exit 2; }
+          mode="$(stat -c '%a' "$token_file")"
+          [ "$mode" = "600" ] || [ "$mode" = "400" ] || { echo "token file mode $mode, expected 600/400" >&2; exit 2; }
+          # Per-job credential home. The login and the scan are separate
+          # processes, so Codex's per-process `ephemeral` store cannot carry
+          # the credential across them; a file store in this 0700 per-job
+          # directory is used instead and is deleted in the final step.
+          printf 'cli_auth_credentials_store = "file"\n' > "$STATE/codex-home/config.toml"
+          export CODEX_HOME="$STATE/codex-home" CODEX_SECURITY_STATE_DIR="$STATE/state"
+          unset OPENAI_API_KEY CODEX_API_KEY
+          "$STATE/tool/node_modules/.bin/codex-security" login --with-access-token < "$token_file" > /dev/null
+          "$STATE/tool/node_modules/.bin/codex-security" login status > /dev/null
+
+      - name: Scan the PR diff (findings stay on the runner)
+        id: scan
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          export CODEX_HOME="$STATE/codex-home" CODEX_SECURITY_STATE_DIR="$STATE/state"
+          unset OPENAI_API_KEY CODEX_API_KEY
+          "$STATE/tool/node_modules/.bin/codex-security" scan . \
+            --diff "origin/${BASE_REF}" \
+            --auth chatgpt \
+            --headless \
+            --json \
+            --output-dir "$STATE/results/scan" \
+            --fail-on-severity high \
+            > "$STATE/results/findings.json" 2> "$STATE/results/scan.stderr"
+          rc=$?
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"
+          echo "codex-security scan exit code: $rc (stdout/stderr kept on runner)"
+
+      - name: Write severity counts to the step summary
+        if: always() && (steps.scan.outputs.exit == '0' || steps.scan.outputs.exit == '1')
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          sarif="$STATE/results/findings.sarif"
+          "$STATE/tool/node_modules/.bin/codex-security" export "$STATE/results/scan" \
+            --output "$sarif" > /dev/null
+          node .github/scripts/codex-security-counts.mjs "$sarif" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce severity threshold
+        if: always()
+        env:
+          SCAN_EXIT: ${{ steps.scan.outputs.exit }}
+        run: |
+          case "${SCAN_EXIT:-missing}" in
+            0) echo "No findings at or above high." ;;
+            1) echo "::error::Findings at or above high (counts in step summary)."; exit 1 ;;
+            *) echo "::error::Scan did not complete (exit ${SCAN_EXIT:-missing}); see runner-local logs."; exit 1 ;;
+          esac
+
+      - name: Remove credentials and findings from the job directory
+        if: always()
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          # Findings are kept under the runner user's private archive (not the
+          # job directory, which other jobs reuse); credentials are not kept.
+          if [ -n "${STATE:-}" ] && [ -d "$STATE" ]; then
+            archive="${CODEX_SECURITY_ARCHIVE_DIR:-}"
+            if [ -n "$archive" ] && [ -d "$STATE/results" ]; then
+              dest="$archive/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              (umask 077 && mkdir -p "$dest" && cp -a "$STATE/results/." "$dest/")
+            fi
+            rm -rf -- "$STATE"
+          fi
