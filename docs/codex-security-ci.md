@@ -1,12 +1,19 @@
 # Codex Security CI (advisory)
 
-`.github/workflows/codex-security.yml` runs an OpenAI Codex Security **diff
-scan** on same-repository pull requests. It is advisory (`continue-on-error`),
-runs only on a private self-hosted runner labelled `yogit-security`, and signs
-in with the maintainer's ChatGPT **access token**.
+`.github/workflows/codex-security.yml` runs OpenAI Codex Security on
+same-repository pull requests in two ways, so the two can be compared
+(dogfooding):
 
-Nothing is registered and no token is stored by the pull request that added
-this file. Until a runner exists, jobs simply queue.
+- **`scan`**: the official CLI (`@openai/codex-security`), `scan --diff`;
+- **`skills`**: the curated `codex-security` plugin (pinned 0.1.32) run by
+  `codex exec`. On a PR it uses the plugin's `security-diff-scan` skill,
+  because `security-scan` refuses diffs by design. On `workflow_dispatch` it
+  uses `security-scan` over the whole repository.
+
+`skills` runs after `scan` and writes CLI-vs-skills overlap counts to the step
+summary. Both jobs are advisory (`continue-on-error`). They run only on a
+private self-hosted runner labelled `yogit-security`, and sign in with the
+maintainer's **persistent ChatGPT device-auth logins** on that runner.
 
 ## Threat model
 
@@ -15,14 +22,14 @@ published.
 
 | Asset | Exposure | Control |
 | --- | --- | --- |
-| ChatGPT access token | Charges the maintainer's subscription; reads/writes their Codex account | Runner-local file (0600, runner user only), never a GitHub secret; per-job credential home deleted in an `always()` step |
+| Two ChatGPT device-auth logins (self-renewing) | Charge the maintainer's plan; read and write their Codex account for as long as the session is valid | `auth.json` files under `/srv/yogit-security/codex-home/` (0700, runner user only), never a GitHub secret, never copied per job; revoke in ChatGPT |
 | Findings (unfixed vulnerabilities) | Would be a public disclosure if printed | Scanner output redirected to a 0700 directory outside the workspace; only severity counts reach `$GITHUB_STEP_SUMMARY`; no artifacts, no PR comments, no SARIF upload |
 | Runner host | Runs workflow code from PR branches | Dedicated unprivileged user, hardened systemd unit, `contents: read` token, fork PRs excluded by an `if:` on head repo |
 
 Residual risks, by design:
 
 - **Anyone with write access can change this workflow in a PR branch and
-  read the token.** A same-repository PR runs its own version of the
+  read the logins.** A same-repository PR runs its own version of the
   workflow. The trust boundary is therefore *repository writers*, the same
   as for any self-hosted runner secret. Keep collaborators to the
   maintainer, or move to an API key with a spend cap.
@@ -36,64 +43,60 @@ Residual risks, by design:
   on the runner. Protect and prune that directory like any vulnerability
   report.
 
-OpenAI's guidance (learn.chatgpt.com/docs/auth) is that access tokens are
-"intended for trusted scripts, schedulers, and private CI runners", that API
-keys remain the recommended default for automation, and not to expose Codex
-execution in untrusted or public environments. This setup follows the first
-by keeping the credential and findings on a private host; the public
-repository is the reason for the counts-only output.
+## Login lifecycle
 
-## Token lifecycle
+ChatGPT **access tokens** are Business/Enterprise only, so they are not used.
+Instead the runner holds the maintainer's own ChatGPT sign-in, created once
+with device auth and **renewed automatically** by Codex (it carries a refresh
+token). This is a personal, long-lived credential on the runner host; treat
+the host accordingly.
 
-1. **Create** a Codex access token in ChatGPT (workspace admins may need to
-   grant the permission).
-2. **Provision** it on the runner, as root, without it touching shell history
-   or argv:
+There are **two independent logins**, one per tool:
 
-   ```sh
-   install -m 0600 -o yogit-security -g yogit-security /dev/null \
-     /srv/yogit-security/secrets/codex-access-token
-   # paste the token, then Ctrl-D
-   cat > /srv/yogit-security/secrets/codex-access-token
-   ```
+| Path | Used by | Why separate |
+| --- | --- | --- |
+| `/srv/yogit-security/codex-home/cli` | `scan` (`CODEX_SECURITY_STATE_DIR`) | codex-security keeps its own Codex home inside its state dir (`cli/codex-home/auth.json`) and ignores `CODEX_HOME` |
+| `/srv/yogit-security/codex-home/skills` | `skills` (`CODEX_HOME`) | the curated plugin installs into this home; sharing `cli/codex-home` would put two `codex-security` plugin versions in one home |
 
-3. **Each job** copies the token into a fresh per-job Codex home via
-   `codex-security login --with-access-token` (stdin), scans, then deletes
-   that home.
+Each login refreshes its own token, so no `auth.json` is ever copied, which
+matters because a refresh rotates the refresh token, and a stale copy would
+silently stop working. The workflow-level `concurrency: yogit-security-auth`
+(`cancel-in-progress: false`) and `needs: scan` make sure no two processes
+refresh at once and a refresh is never cancelled midway.
 
-**Refresh: the token does not refresh itself.** A ChatGPT browser sign-in
-carries a refresh token and Codex renews it during use. An access token
-supplied on stdin is only a bearer credential. OpenAI's docs do not state
-its lifetime. When it expires, the login or scan step fails, the job turns
-red (advisory, non-blocking), and the summary says the scan did not
-complete. The fix is to create a new token and repeat step 2.
+Both jobs start with a `login status` preflight, so a missing or expired login
+fails fast with a clear error rather than mid-scan.
 
-**Why not `ephemeral` storage.** Codex's
-`cli_auth_credentials_store = "ephemeral"` keeps credentials in memory for
-the current process only. `codex-security login` and `codex-security scan`
-are separate processes, so the scan would start signed out. The workflow
-therefore uses the `file` store (an `auth.json` in plaintext) inside a
-per-job directory: mode 0700, outside the checkout, owned by the runner
-user, deleted when the job ends. That plaintext `auth.json` lives for the
-duration of one job.
+**Create or renew** (as root, interactive, approves two device codes):
 
-The alternative is persisting a normal ChatGPT sign-in (with its refresh
-token) in the runner user's `~/.codex/auth.json`. It never needs
-reprovisioning, but it leaves a long-lived, refreshable credential on disk
-permanently. It is not the default here.
+```sh
+sudo PROVISION_LOGIN=1 bash scripts/runner/setup-yogit-security-runner.sh
+```
 
-## Rotation and revocation
+**Revoke:** in ChatGPT, *Settings → Security* (signed-in devices and
+sessions), sign out the two runner sessions. Then
+`systemctl stop yogit-security-runner` and delete
+`/srv/yogit-security/codex-home/{cli,skills}`. To also remove the runner, use
+*Settings → Actions → Runners*.
 
-- **Rotate:** create a new token, overwrite the file (step 2), then revoke
-  the old token in ChatGPT. No workflow change is needed.
-- **Revoke on suspicion:** revoke the token in ChatGPT first. Then
-  `systemctl stop yogit-security-runner`, delete the token file, and remove
-  the runner under *Settings → Actions → Runners*.
+## Host requirements
+
+- **Sandbox:** Codex runs every scan inside bubblewrap, which needs
+  unprivileged user namespaces. The unit allows exactly
+  `RestrictNamespaces=user mnt net pid ipc uts` and adds `AF_NETLINK`, which
+  bwrap needs to configure loopback. With `RestrictNamespaces=yes` every scan
+  fails with *"No permissions to create a new namespace"*.
+- **AppArmor:** on hosts with `kernel.apparmor_restrict_unprivileged_userns=1`
+  (Ubuntu 24.04+), install the distro `bubblewrap` package, because only
+  `/usr/bin/bwrap` carries the allowing profile.
+- `git`, `curl`, Node and npm (for the one-time login install), and Python 3
+  (the scanner's plugin runtime). `actions/setup-node` installs Node for jobs.
 
 ## Where findings live
 
-- **Runner:** `/srv/yogit-security/findings/<run-id>-<attempt>/`
-  (`findings.json`, `scan.stderr`, `scan/` results, `findings.sarif`).
+- **Runner:** `/srv/yogit-security/findings/<run-id>-<attempt>/cli/` and
+  `.../skills/` (canonical `scan/findings.json` for each, plus logs and the
+  CLI's `findings.sarif`).
 - **Codex account:** the scan is attributed to the maintainer's ChatGPT
   account. Nothing is published to GitHub code scanning.
 - **GitHub:** the step summary holds counts only. These come from the
@@ -113,14 +116,15 @@ Use any one of:
 
 - *Actions → Codex Security → Disable workflow* (instant, reversible);
 - `systemctl stop yogit-security-runner` (jobs queue, nothing runs);
-- delete the token file (the next job fails at sign-in).
+- revoke the logins in ChatGPT (the next job fails its login preflight).
 
 ## Cost
 
 Every scan bills the maintainer's ChatGPT plan usage. The defaults are
-model `gpt-5.6-sol` and effort `xhigh`, in Standard (not Deep) mode, with one
-scan per push to a same-repository PR. `cancel-in-progress` drops superseded
-pushes. If usage becomes a concern, consider:
+model `gpt-5.6-sol` and effort `xhigh`, in Standard (not Deep) mode, with plus
+one plugin-skills run per push to a same-repository PR. Runs are serialized
+and never cancelled mid-flight (to protect token refresh), so a quick series
+of pushes queues runs. If usage becomes a concern, consider:
 
 - adding `--max-cost`, which applies to API-key billing estimates;
 - restricting the workflow to `workflow_dispatch`;
@@ -128,15 +132,12 @@ pushes. If usage becomes a concern, consider:
 
 ## Runner setup
 
-Read `scripts/runner/setup-yogit-security-runner.sh` and run it as root on a
-private host. It does **not** start the service and does **not** provision
-the token. The host needs `git`, `curl`, and Python 3 for the scanner's
-plugin runtime. `actions/setup-node` installs Node.
+Read `scripts/runner/setup-yogit-security-runner.sh`, then run it as root on a
+private host. It is safe to re-run: once `runner/.runner` exists, the download
+and registration are skipped unless `FORCE_REREGISTER=1`.
 
-## One-shot provisioning
-
-`REG_TOKEN_FILE=<0600 file> PROVISION_ACCESS_TOKEN=1` lets the setup script take
-the runner registration token from a file (deleted after use) and prompt once,
-hidden, for the ChatGPT access token, then start the unit. This is the path used
-for the first registration (persistent, `EPHEMERAL=0`, because the ephemeral
-re-registration loop is out of scope).
+- First registration: `RUNNER_VERSION`, `RUNNER_SHA256`, `EPHEMERAL=0` and
+  `REG_TOKEN_FILE=<0600 file>`. The registration token is read from the file,
+  which is then deleted.
+- Logins: `PROVISION_LOGIN=1`, as above. This also enables and starts the
+  unit.
