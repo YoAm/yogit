@@ -59,7 +59,9 @@ trap 'rm -rf -- "$tmp"' EXIT
 curl -fsSL -o "$tmp/$tarball" \
   "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${tarball}"
 echo "${RUNNER_SHA256}  $tmp/$tarball" | sha256sum -c -
-runuser -u "$RUNNER_USER" -- tar -xzf "$tmp/$tarball" -C "$RUNNER_HOME/runner"
+# Extract as root (the mktemp dir is 0700 root), then hand the tree to the runner user.
+tar -xzf "$tmp/$tarball" -C "$RUNNER_HOME/runner" --no-same-owner
+chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME/runner"
 
 if [ -n "$REG_TOKEN_FILE" ]; then
   [ -f "$REG_TOKEN_FILE" ] && [ ! -L "$REG_TOKEN_FILE" ] || { echo "REG_TOKEN_FILE is not a regular file" >&2; exit 1; }
