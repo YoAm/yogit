@@ -1,0 +1,285 @@
+# Advisory Codex Security scans on a PRIVATE self-hosted runner.
+#
+# Two jobs dogfood both ways of running Codex Security on the same PR:
+#   scan    the official CLI (`@openai/codex-security`) diff scan;
+#   skills  the curated `codex-security` plugin's skill, run by `codex exec`.
+# A final step in `skills` compares the two result sets.
+#
+# yogit is a public repository: everything these jobs print (logs, step
+# summary) is public. Findings therefore never leave the runner; only counts
+# are written to the step summary. See docs/codex-security-ci.md for the
+# threat model, login lifecycle and kill switch.
+#
+# Inert until a runner labelled `yogit-security` is online with its two
+# persistent ChatGPT logins provisioned; until then queued jobs wait.
+name: Codex Security
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One workflow run at a time, never cancelled mid-flight: both jobs use
+# persistent self-refreshing ChatGPT logins, and a cancelled or concurrent
+# process must never interrupt a token refresh.
+concurrency:
+  group: yogit-security-auth
+  cancel-in-progress: false
+
+env:
+  CODEX_SECURITY_VERSION: 0.5.0
+  CODEX_VERSION: 0.162.1
+  CODEX_SECURITY_PLUGIN: codex-security@openai-curated-remote
+  CODEX_SECURITY_PLUGIN_VERSION: 0.1.32
+  CI: 'true'
+  NO_COLOR: '1'
+  CODEX_SECURITY_NO_UPDATE_NOTICE: '1'
+
+jobs:
+  scan:
+    name: Codex Security CLI diff scan (advisory)
+    # Same-repository PRs only: fork PRs must never reach the self-hosted
+    # runner or the maintainer's ChatGPT login.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: yogit-security
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Check out
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Prepare private per-job scratch outside the workspace
+        id: state
+        run: |
+          set -euo pipefail
+          umask 077
+          state="$(mktemp -d "${RUNNER_TEMP:?}/codex-security.XXXXXXXX")"
+          chmod 700 "$state"
+          mkdir -m 700 "$state/results" "$state/tool"
+          case "$state" in "${GITHUB_WORKSPACE:?}"/*) echo "scratch dir inside workspace" >&2; exit 2 ;; esac
+          echo "dir=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Install codex-security (no install scripts)
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          # Exact pinned version, no install scripts; no lockfile in this repo.
+          npm install --prefix "$STATE/tool" --no-save --no-audit --no-fund --ignore-scripts "@openai/codex-security@${CODEX_SECURITY_VERSION}"  # zizmor: ignore[adhoc-packages]
+          "$STATE/tool/node_modules/.bin/codex-security" --version
+
+      - name: Preflight the persistent ChatGPT login
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          home="${CODEX_SECURITY_HOME:?CODEX_SECURITY_HOME is not set in the runner service environment}"
+          # codex-security keeps its own Codex home under its state dir
+          # (<state>/codex-home), so the persistent login lives in cli/.
+          export CODEX_SECURITY_STATE_DIR="$home/cli"
+          [ -d "$CODEX_SECURITY_STATE_DIR/codex-home" ] || {
+            echo "::error::No codex-security login on the runner. Run the setup script with PROVISION_LOGIN=1 (docs/codex-security-ci.md)."; exit 2; }
+          unset OPENAI_API_KEY CODEX_API_KEY
+          if ! "$STATE/tool/node_modules/.bin/codex-security" login status > /dev/null 2>&1; then
+            echo "::error::The runner's codex-security ChatGPT login is missing or expired. Re-run the setup script with PROVISION_LOGIN=1."
+            exit 2
+          fi
+
+      - name: Scan the PR diff (findings stay on the runner)
+        id: scan
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          export CODEX_SECURITY_STATE_DIR="${CODEX_SECURITY_HOME:?}/cli"
+          unset OPENAI_API_KEY CODEX_API_KEY
+          start=$(date +%s)
+          "$STATE/tool/node_modules/.bin/codex-security" scan . \
+            --diff "origin/${BASE_REF}" \
+            --auth chatgpt \
+            --headless \
+            --json \
+            --output-dir "$STATE/results/scan" \
+            --fail-on-severity high \
+            > "$STATE/results/stdout.json" 2> "$STATE/results/scan.stderr"
+          rc=$?
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"
+          echo "codex-security scan exit code: $rc after $(( $(date +%s) - start ))s (stdout/stderr kept on runner)"
+
+      - name: Write severity counts to the step summary
+        if: always() && (steps.scan.outputs.exit == '0' || steps.scan.outputs.exit == '1')
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          export CODEX_SECURITY_STATE_DIR="${CODEX_SECURITY_HOME:?}/cli"
+          sarif="$STATE/results/findings.sarif"
+          "$STATE/tool/node_modules/.bin/codex-security" export "$STATE/results/scan" \
+            --output "$sarif" > /dev/null
+          node .github/scripts/codex-security-counts.mjs "$sarif" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce severity threshold
+        if: always()
+        env:
+          SCAN_EXIT: ${{ steps.scan.outputs.exit }}
+        run: |
+          case "${SCAN_EXIT:-missing}" in
+            0) echo "No findings at or above high." ;;
+            1) echo "::error::Findings at or above high (counts in step summary)."; exit 1 ;;
+            *) echo "::error::Scan did not complete (exit ${SCAN_EXIT:-missing}); see runner-local logs."; exit 1 ;;
+          esac
+
+      - name: Archive findings privately and clear the job scratch
+        if: always()
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          # Findings go to the runner user's private archive (the job
+          # directory is reused by other jobs). The login is never touched.
+          if [ -n "${STATE:-}" ] && [ -d "$STATE" ]; then
+            archive="${CODEX_SECURITY_ARCHIVE_DIR:-}"
+            if [ -n "$archive" ] && [ -d "$STATE/results" ]; then
+              dest="$archive/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/cli"
+              (umask 077 && mkdir -p "$dest" && cp -a "$STATE/results/." "$dest/")
+            fi
+            rm -rf -- "$STATE"
+          fi
+
+  skills:
+    name: Codex Security plugin-skills scan (advisory)
+    # Runs after `scan` (never alongside it) so the two jobs never refresh a
+    # login at the same time, and so it can compare against the CLI result.
+    needs: scan
+    if: >-
+      always() && (
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: yogit-security
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Check out
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Prepare private per-job scratch outside the workspace
+        id: state
+        run: |
+          set -euo pipefail
+          umask 077
+          state="$(mktemp -d "${RUNNER_TEMP:?}/codex-skills.XXXXXXXX")"
+          chmod 700 "$state"
+          mkdir -m 700 "$state/results" "$state/results/scan" "$state/tool"
+          case "$state" in "${GITHUB_WORKSPACE:?}"/*) echo "scratch dir inside workspace" >&2; exit 2 ;; esac
+          echo "dir=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned Codex CLI (no install scripts)
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          # Exact pinned version, no install scripts; no lockfile in this repo.
+          npm install --prefix "$STATE/tool" --no-save --no-audit --no-fund --ignore-scripts "@openai/codex@${CODEX_VERSION}"  # zizmor: ignore[adhoc-packages]
+          "$STATE/tool/node_modules/.bin/codex" --version
+
+      - name: Preflight the persistent login and the pinned plugin
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          export CODEX_HOME="${CODEX_SECURITY_HOME:?CODEX_SECURITY_HOME is not set in the runner service environment}/skills"
+          unset OPENAI_API_KEY CODEX_API_KEY
+          codex="$STATE/tool/node_modules/.bin/codex"
+          if ! "$codex" login status > /dev/null 2>&1; then
+            echo "::error::The runner's Codex (skills) ChatGPT login is missing or expired. Re-run the setup script with PROVISION_LOGIN=1."
+            exit 2
+          fi
+          # The plugin lives in this persistent home (Codex has no separate
+          # plugin directory). Install it if absent; refuse an unreviewed version.
+          row() { "$codex" plugin list 2>/dev/null | grep -E "^${CODEX_SECURITY_PLUGIN}[[:space:]]" || true; }
+          case "$(row)" in *"installed, enabled"*) ;; *) "$codex" plugin add "$CODEX_SECURITY_PLUGIN" > /dev/null ;; esac
+          r="$(row)"
+          case "$r" in
+            *"installed, enabled"*" ${CODEX_SECURITY_PLUGIN_VERSION} "*) echo "plugin ${CODEX_SECURITY_PLUGIN} ${CODEX_SECURITY_PLUGIN_VERSION} ready" ;;
+            *) echo "::error::Plugin is not ${CODEX_SECURITY_PLUGIN_VERSION} (installed: $(echo "$r" | awk '{print $4}')). Review the new version, then bump CODEX_SECURITY_PLUGIN_VERSION."; exit 2 ;;
+          esac
+
+      - name: Run the plugin skill (findings stay on the runner)
+        id: scan
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          export CODEX_HOME="${CODEX_SECURITY_HOME:?}/skills"
+          unset OPENAI_API_KEY CODEX_API_KEY
+          scan_dir="$STATE/results/scan"
+          if [ "$EVENT" = "pull_request" ]; then
+            # security-scan refuses diffs by design; the diff skill is the
+            # plugin's equivalent of the CLI's `scan --diff`.
+            prompt="Run the \$security-diff-scan skill on the diff from origin/${BASE_REF} to HEAD in the current repository."
+          else
+            prompt="Run the \$security-scan skill on the repository in the current working directory."
+          fi
+          prompt="${prompt} Write all scan artifacts (scan-manifest.json, findings.json, coverage.json) to the output scan directory ${scan_dir} and use it as <scan_dir>. Do not modify repository files. Do not fetch URLs and do not create GitHub issues, comments or pull requests."
+          start=$(date +%s)
+          "$STATE/tool/node_modules/.bin/codex" exec \
+            --sandbox workspace-write \
+            --add-dir "$scan_dir" \
+            -c 'approval_policy="never"' \
+            -c 'sandbox_workspace_write.network_access=false' \
+            --ephemeral \
+            -o "$STATE/results/last-message.md" \
+            "$prompt" < /dev/null \
+            > "$STATE/results/exec.log" 2>&1
+          rc=$?
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"
+          echo "codex exec exit code: $rc after $(( $(date +%s) - start ))s (output kept on runner)"
+          [ -s "$scan_dir/findings.json" ] || echo "::warning::The skill wrote no findings.json; the comparison will report UNQUERIED."
+
+      - name: Compare CLI and plugin-skills results (counts only)
+        if: always()
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cli="${CODEX_SECURITY_ARCHIVE_DIR:-/nonexistent}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/cli/scan/findings.json"
+          node .github/scripts/codex-security-compare.mjs "$cli" "$STATE/results/scan/findings.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive findings privately and clear the job scratch
+        if: always()
+        env:
+          STATE: ${{ steps.state.outputs.dir }}
+        run: |
+          if [ -n "${STATE:-}" ] && [ -d "$STATE" ]; then
+            archive="${CODEX_SECURITY_ARCHIVE_DIR:-}"
+            if [ -n "$archive" ] && [ -d "$STATE/results" ]; then
+              dest="$archive/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/skills"
+              (umask 077 && mkdir -p "$dest" && cp -a "$STATE/results/." "$dest/")
+            fi
+            rm -rf -- "$STATE"
+          fi
