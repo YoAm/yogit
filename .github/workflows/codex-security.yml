@@ -46,7 +46,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, yogit-security]
+    runs-on: yogit-security
     timeout-minutes: 60
     continue-on-error: true
     steps:
@@ -169,7 +169,7 @@ jobs:
       always() && (
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, yogit-security]
+    runs-on: yogit-security
     timeout-minutes: 60
     continue-on-error: true
     steps:
